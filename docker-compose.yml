@@ -1,0 +1,99 @@
+# docker-compose.yml
+# Runs the full checkoutOs stack locally:
+#   - checkoutos   → the API server (port 3000)
+#   - redis        → Redis 7 (port 6379)
+#   - mock-gateway → Razorpay mock server (port 9090)
+#
+# Usage:
+#   docker compose up              # start all services
+#   docker compose up -d           # start in background
+#   docker compose down            # stop and remove containers
+#   docker compose logs -f         # follow logs
+#   docker compose logs checkoutos # logs for one service
+#
+# Prerequisites:
+#   cp .env.example .env
+#   Fill in RAZORPAY_* credentials or leave as-is for mock server usage
+
+services:
+
+  # ── Redis ──────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: checkoutos-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      # Persist Redis data across container restarts
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - checkoutos-network
+
+  # ── Mock Gateway Server ────────────────────────────────────────────────────
+  # Runs the MSW-based mock Razorpay server.
+  # Only needed in development — not included in production deployments.
+  # Remove this service and set RAZORPAY_BASE_URL to the real Razorpay URL
+  # for production use.
+  mock-gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile.mock
+    container_name: checkoutos-mock-gateway
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    environment:
+      MOCK_PORT: 9090
+    networks:
+      - checkoutos-network
+    profiles:
+      # Only starts when explicitly requested:
+      #   docker compose --profile mock up
+      # This prevents the mock server from starting in CI or production
+      - mock
+
+  # ── checkoutOs API ─────────────────────────────────────────────────────────
+  checkoutos:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    container_name: checkoutos-api
+    restart: unless-stopped
+    ports:
+      - "${PORT:-3000}:3000"
+    env_file:
+      # Loads all variables from .env
+      # Copy .env.example to .env and fill in your values
+      - .env
+    environment:
+      # Override REDIS_URL to use the Redis service by container name
+      # This takes precedence over any value in .env
+      REDIS_URL: redis://redis:6379
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 30s
+      retries: 3
+    networks:
+      - checkoutos-network
+
+# ── Volumes ───────────────────────────────────────────────────────────────────
+volumes:
+  redis_data:
+    driver: local
+
+# ── Networks ──────────────────────────────────────────────────────────────────
+networks:
+  checkoutos-network:
+    driver: bridge
