@@ -1,0 +1,843 @@
+openapi: 3.0.3
+
+info:
+  title: checkoutOs API
+  version: 1.0.0
+  description: |
+    A redirect-based, SDK-less HTTP API that wraps Indian payment gateways
+    (Razorpay, PayU, Cashfree) behind a single unified contract.
+
+    ## How it works
+
+    1. Client calls `POST /payments` and receives a `paymentUrl`
+    2. Client redirects the user to `paymentUrl` (gateway-hosted checkout)
+    3. User completes payment on the gateway page
+    4. Gateway fires a webhook to checkoutOs
+    5. checkoutOs normalizes the webhook and relays it to your `WEBHOOK_RELAY_URL`
+
+    ## IDs
+
+    - Payment IDs are prefixed with `chk_` (e.g. `chk_a1b2c3...`)
+    - Refund IDs are prefixed with `ref_` (e.g. `ref_a1b2c3...`)
+    - Gateway-native IDs (`order_XXXX`, `pay_XXXX`) are never exposed externally
+
+    ## Amounts
+
+    All amounts are in **paise** (1 INR = 100 paise).
+    A payment of ₹500.00 is represented as `50000`.
+
+servers:
+  - url: http://localhost:3000
+    description: Local development server
+  - url: https://api.your-domain.com
+    description: Production server
+
+tags:
+  - name: Payments
+    description: Create and manage payments
+  - name: Refunds
+    description: Create and check refund status
+  - name: Webhooks
+    description: Receive gateway webhook events
+  - name: Health
+    description: Service health and liveness
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Paths
+# ─────────────────────────────────────────────────────────────────────────────
+
+paths:
+
+  # ── POST /payments ──────────────────────────────────────────────────────────
+  /payments:
+    post:
+      tags: [Payments]
+      summary: Create a payment
+      description: |
+        Creates a new payment on the active gateway and returns a `paymentUrl`
+        to redirect the user to. The payment starts in `PENDING` status.
+
+        After creation, redirect the user to `data.paymentUrl`. The gateway
+        hosts the checkout page. When the user completes payment, the gateway
+        fires a webhook to checkoutOs which updates the payment status.
+      operationId: createPayment
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreatePaymentRequest'
+            examples:
+              basic:
+                summary: Basic payment
+                value:
+                  amount: 50000
+                  currency: INR
+                  orderId: order_abc123
+              with_customer:
+                summary: Payment with customer details
+                value:
+                  amount: 99900
+                  currency: INR
+                  orderId: order_xyz789
+                  customerName: Priya Sharma
+                  customerEmail: priya@example.com
+                  customerPhone: "9876543210"
+                  description: Premium subscription
+      responses:
+        '201':
+          description: Payment created successfully
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiSuccessResponse'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/PaymentResponse'
+              example:
+                success: true
+                data:
+                  paymentId: chk_a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4
+                  paymentUrl: https://checkout.razorpay.com/v1/checkout/embedded?key=rzp_test_xxx&order_id=order_abc&amount=50000&currency=INR
+                  status: PENDING
+                  amount: 50000
+                  currency: INR
+                  gateway: razorpay
+                  orderId: order_abc123
+                  createdAt: "2024-01-15T10:30:00.000Z"
+        '400':
+          description: Invalid amount
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiErrorResponse'
+              example:
+                success: false
+                error:
+                  code: INVALID_AMOUNT
+                  message: Amount must be a positive integer in paise (e.g. 50000 for ₹500)
+                  details:
+                    received: -100
+        '502':
+          $ref: '#/components/responses/GatewayError'
+        '503':
+          $ref: '#/components/responses/GatewayUnavailable'
+        '504':
+          $ref: '#/components/responses/GatewayTimeout'
+
+  # ── GET /payments/{chkId} ───────────────────────────────────────────────────
+  /payments/{chkId}:
+    get:
+      tags: [Payments]
+      summary: Get payment status
+      description: |
+        Returns the current status of a payment.
+
+        **Re-poll strategy:** For non-terminal statuses (`PENDING`, `PROCESSING`),
+        checkoutOs automatically re-polls the gateway if the stored status is
+        older than 10 seconds. Terminal statuses (`SUCCESS`, `FAILED`, etc.)
+        are served from Redis without hitting the gateway.
+
+        **Terminal statuses** (immutable once set):
+        `SUCCESS`, `FAILED`, `REFUNDED`, `PARTIALLY_REFUNDED`, `CANCELLED`, `EXPIRED`
+      operationId: getPaymentStatus
+      parameters:
+        - $ref: '#/components/parameters/chkId'
+      responses:
+        '200':
+          description: Payment found
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiSuccessResponse'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/PaymentStatusResponse'
+              example:
+                success: true
+                data:
+                  paymentId: chk_a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4
+                  status: SUCCESS
+                  amount: 50000
+                  currency: INR
+                  gateway: razorpay
+                  orderId: order_abc123
+                  createdAt: "2024-01-15T10:30:00.000Z"
+                  updatedAt: "2024-01-15T10:31:30.000Z"
+        '404':
+          $ref: '#/components/responses/PaymentNotFound'
+        '503':
+          $ref: '#/components/responses/GatewayUnavailable'
+        '504':
+          $ref: '#/components/responses/GatewayTimeout'
+
+  # ── POST /payments/{chkId}/refund ───────────────────────────────────────────
+  /payments/{chkId}/refund:
+    post:
+      tags: [Payments, Refunds]
+      summary: Create a refund
+      description: |
+        Initiates a full or partial refund for a payment.
+
+        **Requirements:**
+        - Payment must be in `SUCCESS` or `PARTIALLY_REFUNDED` status
+        - The `payment.captured` webhook must have been received (so `gatewayPaymentId` is set)
+        - Refund amount must not exceed the remaining refundable amount
+
+        **Full refund:** Omit `amount` or set it to the full payment amount.
+
+        **Partial refund:** Provide an `amount` less than the payment amount.
+        Multiple partial refunds can be stacked until the full amount is refunded.
+      operationId: createRefund
+      parameters:
+        - $ref: '#/components/parameters/chkId'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateRefundRequest'
+            examples:
+              full_refund:
+                summary: Full refund (omit amount)
+                value: {}
+              partial_refund:
+                summary: Partial refund
+                value:
+                  amount: 25000
+                  reason: Customer requested partial refund
+      responses:
+        '201':
+          description: Refund initiated successfully
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiSuccessResponse'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/RefundResponse'
+              example:
+                success: true
+                data:
+                  refundId: ref_b1c2d3e4f5a6b1c2d3e4f5a6b1c2d3e4
+                  paymentId: chk_a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4
+                  status: PENDING
+                  amount: 50000
+                  currency: INR
+                  gateway: razorpay
+                  createdAt: "2024-01-15T11:00:00.000Z"
+        '400':
+          description: Invalid refund amount
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiErrorResponse'
+              example:
+                success: false
+                error:
+                  code: INVALID_AMOUNT
+                  message: Amount must be a positive integer in paise
+        '404':
+          $ref: '#/components/responses/PaymentNotFound'
+        '422':
+          description: Refund not allowed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiErrorResponse'
+              examples:
+                wrong_status:
+                  summary: Payment not in refundable status
+                  value:
+                    success: false
+                    error:
+                      code: REFUND_NOT_ALLOWED
+                      message: "Refunds are only allowed on successful payments. Current Status: PENDING"
+                      details:
+                        chkId: chk_a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4
+                        currentStatus: PENDING
+                awaiting_webhook:
+                  summary: Webhook not yet received
+                  value:
+                    success: false
+                    error:
+                      code: REFUND_NOT_ALLOWED
+                      message: "AWAITING_WEBHOOK — payment.captured webhook has not been received yet"
+                amount_exceeded:
+                  summary: Refund amount exceeds remaining
+                  value:
+                    success: false
+                    error:
+                      code: REFUND_AMOUNT_EXCEEDS_PAYMENT
+                      message: Refund amount (60000 paise) exceeds original payment amount (50000 paise)
+        '503':
+          $ref: '#/components/responses/GatewayUnavailable'
+        '504':
+          $ref: '#/components/responses/GatewayTimeout'
+
+  # ── GET /refunds/{refId} ────────────────────────────────────────────────────
+  /refunds/{refId}:
+    get:
+      tags: [Refunds]
+      summary: Get refund status
+      description: |
+        Returns the current status of a refund.
+
+        Uses the same staleness re-poll strategy as `GET /payments/:chkId` —
+        terminal statuses are served from Redis, non-terminal statuses
+        re-poll the gateway after 10 seconds.
+      operationId: getRefundStatus
+      parameters:
+        - $ref: '#/components/parameters/refId'
+      responses:
+        '200':
+          description: Refund found
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiSuccessResponse'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/RefundStatusResponse'
+              example:
+                success: true
+                data:
+                  refundId: ref_b1c2d3e4f5a6b1c2d3e4f5a6b1c2d3e4
+                  paymentId: chk_a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4
+                  status: SUCCESS
+                  amount: 50000
+                  currency: INR
+                  gateway: razorpay
+                  createdAt: "2024-01-15T11:00:00.000Z"
+                  updatedAt: "2024-01-15T11:02:00.000Z"
+        '404':
+          description: Refund not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiErrorResponse'
+              example:
+                success: false
+                error:
+                  code: REFUND_NOT_FOUND
+                  message: "Refund not found: ref_doesnotexist"
+
+  # ── POST /webhooks/{gateway} ────────────────────────────────────────────────
+  /webhooks/{gateway}:
+    post:
+      tags: [Webhooks]
+      summary: Receive gateway webhook
+      description: |
+        Endpoint that payment gateways call when a payment event occurs.
+
+        **Configure in your gateway dashboard:**
+        ```
+        https://your-checkoutos-host/webhooks/razorpay
+        ```
+
+        **Body parsing:** This endpoint receives the raw request body (not JSON-parsed).
+        The raw bytes are required for HMAC-SHA256 signature verification.
+
+        **Signature verification:** checkoutOs verifies the gateway signature before
+        processing. Invalid signatures return 401.
+
+        **Response contract:**
+        - Always returns `200 { received: true }` after signature verification passes
+        - Unknown payments return 200 silently (not 404) to prevent gateway retry storms
+        - Relay failures to `WEBHOOK_RELAY_URL` do not affect the response
+
+        **Events handled:**
+        | Event | Payment Status |
+        |---|---|
+        | `payment.authorized` | `PROCESSING` |
+        | `payment.captured` | `SUCCESS` |
+        | `payment.failed` | `FAILED` |
+        | `refund.processed` | `REFUNDED` or `PARTIALLY_REFUNDED` |
+        | `refund.failed` | `SUCCESS` (payment unchanged) |
+      operationId: receiveWebhook
+      parameters:
+        - name: gateway
+          in: path
+          required: true
+          description: Gateway name (e.g. `razorpay`)
+          schema:
+            type: string
+            enum: [razorpay, payu, cashfree]
+            example: razorpay
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: Raw webhook payload from the gateway
+            example:
+              entity: event
+              account_id: acc_mock001
+              event: payment.captured
+              contains: [payment]
+              payload:
+                payment:
+                  entity:
+                    id: pay_ABC123
+                    order_id: order_XYZ456
+                    amount: 50000
+                    currency: INR
+                    status: captured
+              created_at: 1705314600
+      responses:
+        '200':
+          description: Webhook received and processed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  received:
+                    type: boolean
+                    example: true
+        '401':
+          description: Invalid or missing webhook signature
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiErrorResponse'
+              example:
+                success: false
+                error:
+                  code: GATEWAY_INVALID_SIGNATURE
+                  message: "Webhook signature verification failed for gateway: razorpay"
+
+  # ── GET /health ─────────────────────────────────────────────────────────────
+  /health:
+    get:
+      tags: [Health]
+      summary: Service health check
+      description: |
+        Returns the health status of checkoutOs and its dependencies.
+
+        Used as a liveness probe by load balancers and container orchestrators.
+
+        **HTTP status codes:**
+        - `200` — all services healthy (`status: "ok"`)
+        - `503` — one or more services unhealthy (`status: "degraded"` or `"error"`)
+      operationId: healthCheck
+      responses:
+        '200':
+          description: All services healthy
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiSuccessResponse'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/HealthResponse'
+              example:
+                success: true
+                data:
+                  status: ok
+                  timestamp: "2024-01-15T10:30:00.000Z"
+                  services:
+                    redis:
+                      healthy: true
+                      latencyMs: 1
+                    gateway:
+                      healthy: true
+                      latencyMs: 45
+        '503':
+          description: One or more services unhealthy
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiSuccessResponse'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/HealthResponse'
+              example:
+                success: true
+                data:
+                  status: degraded
+                  timestamp: "2024-01-15T10:30:00.000Z"
+                  services:
+                    redis:
+                      healthy: true
+                      latencyMs: 1
+                    gateway:
+                      healthy: false
+                      error: connect ECONNREFUSED
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Components
+# ─────────────────────────────────────────────────────────────────────────────
+
+components:
+
+  # ── Parameters ──────────────────────────────────────────────────────────────
+  parameters:
+    chkId:
+      name: chkId
+      in: path
+      required: true
+      description: Payment ID with `chk_` prefix
+      schema:
+        type: string
+        pattern: '^chk_[a-f0-9]{32}$'
+        example: chk_a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4
+
+    refId:
+      name: refId
+      in: path
+      required: true
+      description: Refund ID with `ref_` prefix
+      schema:
+        type: string
+        pattern: '^ref_[a-f0-9]{32}$'
+        example: ref_b1c2d3e4f5a6b1c2d3e4f5a6b1c2d3e4
+
+  # ── Schemas ──────────────────────────────────────────────────────────────────
+  schemas:
+
+    # ── Enums ──────────────────────────────────────────────────────────────────
+    PaymentStatus:
+      type: string
+      enum:
+        - PENDING
+        - PROCESSING
+        - SUCCESS
+        - FAILED
+        - REFUNDED
+        - PARTIALLY_REFUNDED
+        - CANCELLED
+        - EXPIRED
+      description: |
+        Unified payment status. Terminal statuses (SUCCESS, FAILED, REFUNDED,
+        PARTIALLY_REFUNDED, CANCELLED, EXPIRED) are immutable once set.
+
+    RefundStatus:
+      type: string
+      enum:
+        - PENDING
+        - PROCESSING
+        - SUCCESS
+        - FAILED
+
+    Currency:
+      type: string
+      enum: [INR]
+      description: V1.0 supports INR only
+
+    # ── Request Bodies ─────────────────────────────────────────────────────────
+    CreatePaymentRequest:
+      type: object
+      required: [amount, currency, orderId]
+      properties:
+        amount:
+          type: integer
+          minimum: 1
+          description: Amount in paise (1 INR = 100 paise). Must be a positive integer.
+          example: 50000
+        currency:
+          $ref: '#/components/schemas/Currency'
+        orderId:
+          type: string
+          minLength: 1
+          description: Your internal order reference. Stored but not validated.
+          example: order_abc123
+        customerName:
+          type: string
+          description: Pre-fills the customer name on the gateway checkout page
+          example: Priya Sharma
+        customerEmail:
+          type: string
+          format: email
+          description: Pre-fills the customer email on the gateway checkout page
+          example: priya@example.com
+        customerPhone:
+          type: string
+          description: Pre-fills the customer phone on the gateway checkout page
+          example: "9876543210"
+        description:
+          type: string
+          description: Payment description shown on the checkout page
+          example: Premium subscription - January 2024
+        metadata:
+          type: object
+          additionalProperties:
+            type: string
+          description: Arbitrary key-value pairs passed through to the gateway
+          example:
+            planId: plan_premium
+            userId: user_12345
+
+    CreateRefundRequest:
+      type: object
+      properties:
+        amount:
+          type: integer
+          minimum: 1
+          description: |
+            Amount to refund in paise. Omit for a full refund.
+            Must not exceed the remaining refundable amount.
+          example: 25000
+        reason:
+          type: string
+          description: Refund reason (passed to the gateway)
+          example: Customer requested refund
+
+    # ── Response Bodies ────────────────────────────────────────────────────────
+    ApiSuccessResponse:
+      type: object
+      required: [success, data]
+      properties:
+        success:
+          type: boolean
+          enum: [true]
+        data:
+          type: object
+
+    ApiErrorResponse:
+      type: object
+      required: [success, error]
+      properties:
+        success:
+          type: boolean
+          enum: [false]
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              description: Machine-readable error code
+              example: PAYMENT_NOT_FOUND
+            message:
+              type: string
+              description: Human-readable error description
+              example: "Payment not found: chk_abc123"
+            details:
+              type: object
+              additionalProperties: true
+              description: Additional context about the error
+
+    PaymentResponse:
+      type: object
+      required: [paymentId, paymentUrl, status, amount, currency, gateway, orderId, createdAt]
+      properties:
+        paymentId:
+          type: string
+          pattern: '^chk_[a-f0-9]{32}$'
+          description: checkoutOs payment ID. Use this for all subsequent API calls.
+          example: chk_a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4
+        paymentUrl:
+          type: string
+          format: uri
+          description: Gateway-hosted checkout URL. Redirect the user here.
+          example: https://checkout.razorpay.com/v1/checkout/embedded?key=rzp_xxx
+        status:
+          $ref: '#/components/schemas/PaymentStatus'
+        amount:
+          type: integer
+          description: Amount in paise
+          example: 50000
+        currency:
+          $ref: '#/components/schemas/Currency'
+        gateway:
+          type: string
+          description: Active gateway name
+          example: razorpay
+        orderId:
+          type: string
+          description: Your internal order reference
+          example: order_abc123
+        createdAt:
+          type: string
+          format: date-time
+          example: "2024-01-15T10:30:00.000Z"
+
+    PaymentStatusResponse:
+      type: object
+      required: [paymentId, status, amount, currency, gateway, orderId, createdAt, updatedAt]
+      properties:
+        paymentId:
+          type: string
+          pattern: '^chk_[a-f0-9]{32}$'
+          example: chk_a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4
+        status:
+          $ref: '#/components/schemas/PaymentStatus'
+        amount:
+          type: integer
+          example: 50000
+        currency:
+          $ref: '#/components/schemas/Currency'
+        gateway:
+          type: string
+          example: razorpay
+        orderId:
+          type: string
+          example: order_abc123
+        createdAt:
+          type: string
+          format: date-time
+          example: "2024-01-15T10:30:00.000Z"
+        updatedAt:
+          type: string
+          format: date-time
+          example: "2024-01-15T10:31:30.000Z"
+
+    RefundResponse:
+      type: object
+      required: [refundId, paymentId, status, amount, currency, gateway, createdAt]
+      properties:
+        refundId:
+          type: string
+          pattern: '^ref_[a-f0-9]{32}$'
+          example: ref_b1c2d3e4f5a6b1c2d3e4f5a6b1c2d3e4
+        paymentId:
+          type: string
+          pattern: '^chk_[a-f0-9]{32}$'
+          example: chk_a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4
+        status:
+          $ref: '#/components/schemas/RefundStatus'
+        amount:
+          type: integer
+          example: 50000
+        currency:
+          $ref: '#/components/schemas/Currency'
+        gateway:
+          type: string
+          example: razorpay
+        createdAt:
+          type: string
+          format: date-time
+          example: "2024-01-15T11:00:00.000Z"
+
+    RefundStatusResponse:
+      type: object
+      required: [refundId, paymentId, status, amount, currency, gateway, createdAt, updatedAt]
+      properties:
+        refundId:
+          type: string
+          pattern: '^ref_[a-f0-9]{32}$'
+          example: ref_b1c2d3e4f5a6b1c2d3e4f5a6b1c2d3e4
+        paymentId:
+          type: string
+          pattern: '^chk_[a-f0-9]{32}$'
+          example: chk_a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4
+        status:
+          $ref: '#/components/schemas/RefundStatus'
+        amount:
+          type: integer
+          example: 50000
+        currency:
+          $ref: '#/components/schemas/Currency'
+        gateway:
+          type: string
+          example: razorpay
+        createdAt:
+          type: string
+          format: date-time
+          example: "2024-01-15T11:00:00.000Z"
+        updatedAt:
+          type: string
+          format: date-time
+          example: "2024-01-15T11:02:00.000Z"
+
+    HealthResponse:
+      type: object
+      required: [status, timestamp, services]
+      properties:
+        status:
+          type: string
+          enum: [ok, degraded, error]
+          description: |
+            ok       — all services healthy
+            degraded — at least one service unhealthy
+            error    — all services unhealthy
+        timestamp:
+          type: string
+          format: date-time
+        services:
+          type: object
+          required: [redis, gateway]
+          properties:
+            redis:
+              $ref: '#/components/schemas/ServiceHealth'
+            gateway:
+              $ref: '#/components/schemas/ServiceHealth'
+
+    ServiceHealth:
+      type: object
+      required: [healthy]
+      properties:
+        healthy:
+          type: boolean
+        latencyMs:
+          type: integer
+          description: Round-trip latency in milliseconds
+        error:
+          type: string
+          description: Error message if unhealthy
+
+  # ── Reusable Responses ───────────────────────────────────────────────────────
+  responses:
+    PaymentNotFound:
+      description: Payment not found
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiErrorResponse'
+          example:
+            success: false
+            error:
+              code: PAYMENT_NOT_FOUND
+              message: "Payment not found: chk_abc123"
+              details:
+                chkId: chk_abc123
+
+    GatewayError:
+      description: Gateway returned an unexpected response
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiErrorResponse'
+          example:
+            success: false
+            error:
+              code: PAYMENT_CREATION_FAILED
+              message: Failed to create payment on razorpay
+
+    GatewayUnavailable:
+      description: Gateway is unreachable
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiErrorResponse'
+          example:
+            success: false
+            error:
+              code: GATEWAY_UNAVAILABLE
+              message: Gateway razorpay is currently unavailable
+
+    GatewayTimeout:
+      description: Gateway request timed out
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiErrorResponse'
+          example:
+            success: false
+            error:
+              code: GATEWAY_TIMEOUT
+              message: "Gateway razorpay timed out during: createPayment"
