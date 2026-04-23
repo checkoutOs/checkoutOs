@@ -12,9 +12,10 @@ import type {
   GatewayPlugin,
   GatewayRefundResult,
   WebhookEvent,
+  CheckoutAction,
 } from '../../types/gateway.types';
 import type { GatewayName } from '../../types/payment.types';
-import { PaymentStatus } from '../../types/payment.types';
+import { PaymentStatus, StoredPayment } from '../../types/payment.types';
 
 import {
   GatewayTimeoutError,
@@ -353,6 +354,19 @@ export class RazorpayPlugin implements GatewayPlugin {
     } catch {
       return { healthy: false, latencyMs: Date.now() - start };
     }
+  }
+
+  public getCheckoutAction(payment: StoredPayment): CheckoutAction {
+    return {
+      type: 'render',
+      templateData: {
+        chkId: payment.chkId,
+        gatewayOrderId: payment.gatewayOrderId,
+        amount: payment.amount,
+        currency: payment.currency,
+        keyId: this.creds.keyId,
+      },
+    };
   }
 
   private mapWebhookEventToStatus(
