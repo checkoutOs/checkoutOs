@@ -79,6 +79,11 @@ const BaseEnvSchema = z.object({
   PAYU_MERCHANT_SALT: z.string().optional(),
   PAYU_WEBHOOK_SECRET: z.string().optional(),
 
+  // ── Paytm credentials ─────────────────────────────────────────────────────
+  PAYTM_MERCHANT_ID: z.string().optional(),
+  PAYTM_MERCHANT_KEY: z.string().optional(),
+  PAYTM_WEBHOOK_SECRET: z.string().optional(),
+
   // ── Cashfree credentials ───────────────────────────────────────────────────
 
   CASHFREE_APP_ID: z.string().optional(),
