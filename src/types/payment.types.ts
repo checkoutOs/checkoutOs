@@ -128,6 +128,10 @@ export interface StoredPayment {
   amount: number;
   currency: Currency;
   status: PaymentStatus;
+  // Gateway-issued payment URL stored at creation time.
+  // Used by Paytm for redirect-based checkout (getCheckoutAction reads this).
+  // Empty / absent for Razorpay (uses embedded SDK, not a redirect URL).
+  paymentUrl?: string;
   createdAt: string;
   updatedAt: string;
 }
