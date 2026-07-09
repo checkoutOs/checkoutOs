@@ -41,6 +41,7 @@ export interface GatewayPaymentResult {
   amount: number;
   currency: Currency;
   gatewayOrderId?: string; // some gateway like Razorpay use an order Id
+  paymentUrl?: string; // Paytm returns an external redirect URL
   raw?: unknown; // Original gateway response - dubug only
 }
 
@@ -84,6 +85,12 @@ export interface GatewayHealthResult {
 // - render: render HTML page with embedded SDK (Razorpay)
 
 export interface CheckoutAction {
+  /**
+  This abstraction allows each gateway plugin to decide how checkout should be initiated 
+  New gateways can introduce their own checkout flow by implementing
+  getCheckoutAction() without requiring any controller changes.
+   */
+
   type: 'redirect' | 'render';
   url?: string; // Required for 'redirect'
   templateData?: Record<string, unknown>; // Required for 'render'
