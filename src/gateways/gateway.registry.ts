@@ -171,6 +171,11 @@ export function registerGateways(
           webhookSecret: credentials['webhookSecret'] ?? '',
         },
         baseUrl,
+        // Pass websiteName only when explicitly set — plugin defaults to 'WEBSTAGING'
+        ...(typeof env['PAYTM_WEBSITE_NAME'] === 'string' &&
+          env['PAYTM_WEBSITE_NAME'].trim() !== '' && {
+            websiteName: env['PAYTM_WEBSITE_NAME'],
+          }),
       };
       gatewayPlugins['paytm'] = createPaytmPlugin(paytmConfig);
       break;

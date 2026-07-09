@@ -66,6 +66,10 @@ export interface PaytmCredentials {
 export interface PaytmConfig {
   credentials: PaytmCredentials;
   baseUrl: string;
+  // Paytm website name — identifies the checkout environment.
+  // Defaults to 'WEBSTAGING' (sandbox). Set to 'DEFAULT' in production
+  // or to the custom name assigned by Paytm for your merchant account.
+  websiteName?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -146,12 +150,15 @@ export class PaytmPlugin implements GatewayPlugin {
   private readonly http: AxiosInstance;
   private readonly mapper: PaytmMapper;
   private readonly webhookSecret: string;
+  private readonly websiteName: string;
 
   constructor(config: PaytmConfig) {
     this.creds = config.credentials;
     this.mapper = new PaytmMapper();
     // Webhook secret falls back to merchant key if not explicitly set
     this.webhookSecret = config.credentials.webhookSecret || config.credentials.merchantKey;
+    // Website name defaults to 'WEBSTAGING' for sandbox; must be overridden for production
+    this.websiteName = config.websiteName ?? 'WEBSTAGING';
 
     this.http = axios.create({
       baseURL: config.baseUrl,
@@ -177,7 +184,7 @@ export class PaytmPlugin implements GatewayPlugin {
     const body: PaytmSendPaymentRequestBody = {
       requestType: 'Payment',
       mid: this.creds.merchantId,
-      websiteName: 'WEBSTAGING', // Default for staging; production override needed
+      websiteName: this.websiteName,
       orderId: params.orderId,
       txnAmount: {
         value: this.mapper.formatAmountRupees(params.amount),
@@ -429,24 +436,18 @@ export class PaytmPlugin implements GatewayPlugin {
   // ---------------------------------------------------------------------------
   // getCheckoutAction
   // ---------------------------------------------------------------------------
-  // Paytm is redirect-based — returns the payment URL for 302 redirect.
-  // The paymentUrl was stored during createPayment() and is read from
-  // the StoredPayment record (accessible via raw or a dedicated field).
+  // Paytm is redirect-based — returns a 302 redirect to the payment URL.
   //
-  // Since StoredPayment doesn't have a paymentUrl field, we reconstruct it
-  // from the gatewayOrderId. The actual URL format depends on Paytm's
-  // payment page URL structure.
+  // Primary path: read paymentUrl from StoredPayment (stored during createPayment).
+  // Fallback path: reconstruct from gatewayOrderId — handles legacy records
+  // created before paymentUrl storage was introduced.
 
   public getCheckoutAction(payment: StoredPayment): CheckoutAction {
-    // Construct the Paytm payment page URL
-    // In production, this would be read from the stored payment record
-    // after the service layer stores it during createPayment.
-    const url = `${this.http.defaults.baseURL}/theia/api/v1/showPaymentPage?mid=${this.creds.merchantId}&orderId=${encodeURIComponent(payment.gatewayOrderId)}`;
+    const url =
+      payment.paymentUrl ??
+      `${this.http.defaults.baseURL}/theia/api/v1/showPaymentPage?mid=${this.creds.merchantId}&orderId=${encodeURIComponent(payment.gatewayOrderId)}`;
 
-    return {
-      type: 'redirect',
-      url,
-    };
+    return { type: 'redirect', url };
   }
 
   // ---------------------------------------------------------------------------

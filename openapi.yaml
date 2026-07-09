@@ -5,7 +5,7 @@ info:
   version: 1.0.0
   description: |
     A redirect-based, SDK-less HTTP API that wraps Indian payment gateways
-    (Razorpay, PayU, Cashfree) behind a single unified contract.
+    (Razorpay, Paytm, PayU, Cashfree) behind a single unified contract.
 
     ## How it works
 
@@ -370,7 +370,7 @@ paths:
           description: Gateway name (e.g. `razorpay`)
           schema:
             type: string
-            enum: [razorpay, payu, cashfree]
+            enum: [razorpay, paytm, payu, cashfree]
             example: razorpay
       requestBody:
         required: true
@@ -566,7 +566,10 @@ components:
           example: priya@example.com
         customerPhone:
           type: string
-          description: Pre-fills the customer phone on the gateway checkout page
+          description: |
+            Pre-fills the customer phone on the gateway checkout page.
+            **Required when `ACTIVE_GATEWAY=paytm`** — Paytm sends the payment
+            link via SMS to this number. Requests without it return HTTP 400.
           example: "9876543210"
         description:
           type: string

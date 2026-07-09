@@ -84,6 +84,12 @@ const BaseEnvSchema = z.object({
   PAYTM_MERCHANT_KEY: z.string().optional(),
   PAYTM_WEBHOOK_SECRET: z.string().optional(),
 
+  // Paytm website name — identifies the checkout environment.
+  // Sandbox:    WEBSTAGING  (default when this var is absent)
+  // Production: DEFAULT     (or a custom name assigned by Paytm)
+  // Hardcoding 'WEBSTAGING' in production causes payment failures.
+  PAYTM_WEBSITE_NAME: z.string().optional(),
+
   // Optional base URL override for Paytm.
   // When set, the plugin uses this instead of the production Paytm API URL.
   // Use this to point the plugin at your local mock server during development
