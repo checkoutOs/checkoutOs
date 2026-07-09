@@ -54,6 +54,8 @@ function serialisePayment(payment: StoredPayment): Record<string, string> {
     amount: String(payment.amount),
     currency: payment.currency,
     status: payment.status,
+    // Only write paymentUrl when it has a value — omit empty hash fields.
+    ...(payment.paymentUrl ? { paymentUrl: payment.paymentUrl } : {}),
     createdAt: payment.createdAt,
     updatedAt: payment.updatedAt,
   };
@@ -69,6 +71,8 @@ function deserialisePayment(raw: Record<string, string>): StoredPayment {
     amount: parseInt(raw['amount'] ?? '0', 10),
     currency: raw['currency'] as StoredPayment['currency'],
     status: raw['status'] as PaymentStatus,
+    // paymentUrl is only present when stored — absent for Razorpay payments.
+    ...(raw['paymentUrl'] ? { paymentUrl: raw['paymentUrl'] } : {}),
     createdAt: raw['createdAt'] ?? '',
     updatedAt: raw['updatedAt'] ?? '',
   };
