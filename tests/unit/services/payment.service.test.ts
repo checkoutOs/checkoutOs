@@ -254,6 +254,31 @@ describe('createPayment — StoredPayment saved correctly', () => {
     const result = await createPayment(baseCreateRequest);
     expect(result.status).toBe(PaymentStatus.PENDING);
   });
+
+  it('stores gateway paymentUrl in gatewayMetadata when gateway returns one', async () => {
+    // The mock createPayment returns paymentUrl — service must store it in gatewayMetadata
+    await createPayment(baseCreateRequest);
+
+    const savedPayment = vi.mocked(savePayment).mock.calls[0][0];
+    expect(savedPayment.gatewayMetadata).toBeDefined();
+    expect(savedPayment.gatewayMetadata?.['paymentUrl']).toBe('https://checkout.razorpay.com/test');
+  });
+
+  it('omits gatewayMetadata entirely when gateway returns no paymentUrl', async () => {
+    // Gateway result without paymentUrl — field must be absent, not empty object
+    mockGatewayPlugin.createPayment.mockResolvedValueOnce({
+      gatewayId: 'order_nopaymenturl',
+      status: PaymentStatus.PENDING,
+      amount: 50000,
+      currency: 'INR',
+      // No paymentUrl field
+    });
+
+    await createPayment(baseCreateRequest);
+
+    const savedPayment = vi.mocked(savePayment).mock.calls[0][0];
+    expect(savedPayment.gatewayMetadata).toBeUndefined();
+  });
 });
 
 // ---------------------------------------------------------------------------
