@@ -102,10 +102,12 @@ export async function createPayment(req: CreatePaymentRequest): Promise<PaymentR
     amount: req.amount,
     currency: req.currency,
     status: gatewayResult.status,
-    // Store the gateway-issued payment URL for redirect-based gateways (e.g. Paytm).
-    // getCheckoutAction() reads this so it never needs to reconstruct or re-fetch the URL.
-    // Absent for SDK-based gateways (Razorpay) where checkout is embedded.
-    ...(gatewayResult.paymentUrl ? { paymentUrl: gatewayResult.paymentUrl } : {}),
+    // Paytm returns a paymentUrl that getCheckoutAction() needs for the 302 redirect.
+    // Store it in gatewayMetadata so the core schema stays uniform across all gateways.
+    // Razorpay returns no paymentUrl — gatewayMetadata is absent for Razorpay payments.
+    ...(gatewayResult.paymentUrl
+      ? { gatewayMetadata: { paymentUrl: gatewayResult.paymentUrl } }
+      : {}),
     createdAt: timestamp,
     updatedAt: timestamp,
   };
