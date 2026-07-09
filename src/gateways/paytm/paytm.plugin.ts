@@ -438,13 +438,16 @@ export class PaytmPlugin implements GatewayPlugin {
   // ---------------------------------------------------------------------------
   // Paytm is redirect-based — returns a 302 redirect to the payment URL.
   //
-  // Primary path: read paymentUrl from StoredPayment (stored during createPayment).
-  // Fallback path: reconstruct from gatewayOrderId — handles legacy records
-  // created before paymentUrl storage was introduced.
+  // Primary path: read paymentUrl from gatewayMetadata (written during createPayment).
+  //   Paytm's initiateTransaction response includes the exact URL — storing it
+  //   in gatewayMetadata at creation time means no network call is needed here.
+  //
+  // Fallback path: reconstruct from gatewayOrderId.
+  //   Handles records created before the gatewayMetadata field was introduced.
 
   public getCheckoutAction(payment: StoredPayment): CheckoutAction {
     const url =
-      payment.paymentUrl ??
+      payment.gatewayMetadata?.['paymentUrl'] ??
       `${this.http.defaults.baseURL}/theia/api/v1/showPaymentPage?mid=${this.creds.merchantId}&orderId=${encodeURIComponent(payment.gatewayOrderId)}`;
 
     return { type: 'redirect', url };
