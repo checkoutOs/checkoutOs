@@ -11,10 +11,9 @@
 //   verification would always fail.
 
 import { Router } from 'express';
-import express from 'express';
 import { receive } from '../controllers/webhooks.controllers';
 
 export const webhookRouter = Router();
 
 // Apply raw body parser before the handler — preserves Buffer for HMAC
-webhookRouter.post('/:gateway', express.raw({ type: 'application/json' }), receive);
+webhookRouter.post('/:gateway', receive);
