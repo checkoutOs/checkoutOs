@@ -19,6 +19,7 @@ import type { GatewayName } from '../types/payment.types';
 import type { GatewayPlugin } from '../types/gateway.types';
 import { GatewayUnavailableError } from '../errors/gateways.errors';
 import { createRazorpayPlugin, type RazorpayConfig } from './razorpay/razorpay.plugin';
+import { createPaytmPlugin, type PaytmConfig } from './paytm/paytm.plugin';
 
 // ---------------------------------------------------------------------------
 // Supported gateways
@@ -163,20 +164,16 @@ export function registerGateways(
     }
 
     case 'paytm': {
-      // TODO: implement when Paytm plugin is ready
-      // const paytmConfig: PaytmConfig = {
-      //   credentials: {
-      //     merchantId: credentials['merchantId'] ?? '',
-      //     merchantKey: credentials['merchantKey'] ?? '',
-      //     webhookSecret: credentials['webhookSecret'] ?? '',
-      //   },
-      //   baseUrl,
-      // };
-      // gatewayPlugins['paytm'] = createPaytmPlugin(paytmConfig);
-      throw new Error(
-        `Gateway "paytm" is listed as supported but its plugin is not yet implemented. ` +
-          `Implement createPaytmPlugin in src/gateways/paytm/paytm.plugin.ts.`,
-      );
+      const paytmConfig: PaytmConfig = {
+        credentials: {
+          merchantId: credentials['merchantId'] ?? '',
+          merchantKey: credentials['merchantKey'] ?? '',
+          webhookSecret: credentials['webhookSecret'] ?? '',
+        },
+        baseUrl,
+      };
+      gatewayPlugins['paytm'] = createPaytmPlugin(paytmConfig);
+      break;
     }
 
     case 'payu':
