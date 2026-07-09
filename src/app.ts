@@ -3,18 +3,18 @@
 //
 // Responsibilities:
 //   1. Register global middleware (request logger)
-//   2. Mount webhook router BEFORE express.json() — preserves raw Buffer for HMAC
-//   3. Register express.json() for all other routes
-//   4. Mount remaining routes
-//   5. Register not-found handler (after routes)
-//   6. Register error handler (last — always)
+//   2. Mount gateway-specific webhook body parsers BEFORE express.json()
+//   3. Mount webhook router
+//   4. Register express.json() for all other routes
+//   5. Mount remaining routes
+//   6. Register not-found handler (after routes)
+//   7. Register error handler (last — always)
 //
 // Body parsing order matters:
-//   webhookRouter   ← mounted first, uses express.raw() internally
-//   express.json()  ← runs after webhook router, applies to all other routes
-//
-// server.ts imports buildApp() and initialise() — never calls listen() itself.
-// Keeping app and server separate makes the app testable without binding a port.
+//   express.raw()       ← Razorpay webhooks (JSON Buffer for HMAC)
+//   express.urlencoded()← Paytm webhooks (NVP parsed object for CHECKSUMHASH)
+//   webhookRouter       ← handles POST /webhooks/:gateway
+//   express.json()      ← runs after, applies to all other routes
 
 import express, { Application, Request, Response, NextFunction } from 'express';
 import { registerGateways } from './gateways/gateway.registry';
@@ -57,27 +57,37 @@ export function buildApp(): Application {
     next();
   });
 
-  // ── 2. Webhook router — BEFORE express.json() ────────────────────────────
-  // webhookRouter applies express.raw({ type: 'application/json' }) internally.
-  // Mounting it here ensures the body stream is intact when raw() runs.
-  // If express.json() ran first it would consume the stream and HMAC
-  // verification would always fail with an incorrect signature.
+  // ── 2. Gateway-specific webhook body parsers — BEFORE express.json() ─────
+  // Each gateway requires a different body format for webhook verification:
+  //   Razorpay: application/json                  → raw Buffer for HMAC-SHA256
+  //   Paytm:    application/x-www-form-urlencoded → parsed object for CHECKSUMHASH
+  //
+  // These MUST run before express.json() so the body stream is intact.
+
+  // Razorpay webhooks: preserve raw Buffer for HMAC verification
+  app.use('/webhooks/razorpay', express.raw({ type: 'application/json' }));
+
+  // Paytm webhooks: parse URL-encoded NVP format for CHECKSUMHASH verification
+  app.use('/webhooks/paytm', express.urlencoded({ extended: true }));
+
+  // ── 3. Webhook router ────────────────────────────────────────────────────
+  // Body parsing is handled above per gateway — the router only handles routing.
   app.use('/webhooks', webhookRouter);
 
-  // ── 3. JSON body parser — for all remaining routes ───────────────────────
+  // ── 4. JSON body parser — for all remaining routes ───────────────────────
   app.use(express.json());
 
-  // ── 4. Routes ─────────────────────────────────────────────────────────────
+  // ── 5. Routes ─────────────────────────────────────────────────────────────
   app.use('/payments', paymentRouter);
   app.use('/refunds', refundRouter);
   app.use('/health', healthRouter);
   app.use('/checkout', checkoutRouter);
 
-  // ── 5. Not-found handler ──────────────────────────────────────────────────
+  // ── 6. Not-found handler ──────────────────────────────────────────────────
   // After all routes — fires only when no route matched.
   app.use(notFoundHandler);
 
-  // ── 6. Error handler ──────────────────────────────────────────────────────
+  // ── 7. Error handler ──────────────────────────────────────────────────────
   // Must be last — Express identifies error middleware by 4-argument signature.
   app.use(errorHandler);
 

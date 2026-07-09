@@ -19,6 +19,7 @@ import type { GatewayName } from '../types/payment.types';
 import type { GatewayPlugin } from '../types/gateway.types';
 import { GatewayUnavailableError } from '../errors/gateways.errors';
 import { createRazorpayPlugin, type RazorpayConfig } from './razorpay/razorpay.plugin';
+import { createPaytmPlugin, type PaytmConfig } from './paytm/paytm.plugin';
 
 // ---------------------------------------------------------------------------
 // Supported gateways
@@ -26,7 +27,7 @@ import { createRazorpayPlugin, type RazorpayConfig } from './razorpay/razorpay.p
 // consumed by env.schema.ts for ACTIVE_GATEWAY validation.
 // Add new gateway names here when implementing new plugins.
 
-export const supportedGateways = ['razorpay', 'payu', 'cashfree'] as const;
+export const supportedGateways = ['razorpay', 'payu', 'cashfree', 'paytm'] as const;
 export type SupportedGatewayName = (typeof supportedGateways)[number];
 
 // ---------------------------------------------------------------------------
@@ -50,6 +51,11 @@ export const gatewayEnvDefinitions = {
     requiredEnvKeys: ['PAYU_MERCHANT_KEY', 'PAYU_MERCHANT_SALT', 'PAYU_WEBHOOK_SECRET'] as const,
     defaultBaseUrl: 'https://api.payu.in',
     baseUrlEnvKey: 'PAYU_BASE_URL',
+  },
+  paytm: {
+    requiredEnvKeys: ['PAYTM_MERCHANT_ID', 'PAYTM_MERCHANT_KEY'] as const,
+    defaultBaseUrl: 'https://securegw.paytm.in',
+    baseUrlEnvKey: 'PAYTM_BASE_URL',
   },
   cashfree: {
     requiredEnvKeys: ['CASHFREE_APP_ID', 'CASHFREE_SECRET_KEY', 'CASHFREE_WEBHOOK_SECRET'] as const,
@@ -83,6 +89,12 @@ export const gatewayCredentialEnvKeys = {
     merchantSalt: 'PAYU_MERCHANT_SALT',
     webhookSecret: 'PAYU_WEBHOOK_SECRET',
   },
+  paytm: {
+    merchantId: 'PAYTM_MERCHANT_ID',
+    merchantKey: 'PAYTM_MERCHANT_KEY',
+    webhookSecret: 'PAYTM_WEBHOOK_SECRET',
+  },
+
   cashfree: {
     appId: 'CASHFREE_APP_ID',
     secretKey: 'CASHFREE_SECRET_KEY',
@@ -151,6 +163,19 @@ export function registerGateways(
       break;
     }
 
+    case 'paytm': {
+      const paytmConfig: PaytmConfig = {
+        credentials: {
+          merchantId: credentials['merchantId'] ?? '',
+          merchantKey: credentials['merchantKey'] ?? '',
+          webhookSecret: credentials['webhookSecret'] ?? '',
+        },
+        baseUrl,
+      };
+      gatewayPlugins['paytm'] = createPaytmPlugin(paytmConfig);
+      break;
+    }
+
     case 'payu':
       // TODO: implement when PayU plugin is ready
       // gatewayPlugins['payu'] = createPayuPlugin({ credentials, baseUrl });
@@ -168,8 +193,6 @@ export function registerGateways(
       );
 
     default: {
-      // TypeScript exhaustiveness guard — this branch is unreachable if
-      // SupportedGatewayName and the switch cases are kept in sync.
       const _exhaustive: never = gateway;
       throw new Error(`Unhandled gateway in registerGateways: ${String(_exhaustive)}`);
     }

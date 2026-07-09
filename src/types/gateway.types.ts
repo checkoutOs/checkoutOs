@@ -1,10 +1,10 @@
 // gateway.types.ts
 //  Interfaces and types that define the gateway plugin contract.
-// Every gateway adapter (Razorpay, PayU, Cashfree) must conform to these.
+// Every gateway adapter (Razorpay, Paytm, Cashfree) must conform to these.
 //  Nothing in this file ever return to API clients directly
 // services translate these into payment.types.ts shape first
 
-import { GatewayName, PaymentStatus, RefundStatus, Currency } from './payment.types';
+import { GatewayName, PaymentStatus, RefundStatus, Currency, StoredPayment } from './payment.types';
 
 // createPayment() input
 
@@ -41,6 +41,7 @@ export interface GatewayPaymentResult {
   amount: number;
   currency: Currency;
   gatewayOrderId?: string; // some gateway like Razorpay use an order Id
+  paymentUrl?: string; // Paytm returns an external redirect URL
   raw?: unknown; // Original gateway response - dubug only
 }
 
@@ -64,6 +65,10 @@ export interface GatewayRefundResult {
 export interface WebhookEvent {
   gateway: GatewayName;
   gatewayPaymentId: string; // use for Redis reverse look to find chk_
+  // Optional gateway order ID. Populated by plugins that have a separate
+  // order ID (e.g. Paytm's ORDERID). The webhook service uses this for
+  // fallback lookup when gatewayPaymentId is not yet in Redis (first webhook).
+  gatewayOrderId?: string;
   event: string;
   status: PaymentStatus;
   amount: number;
@@ -76,6 +81,23 @@ export interface WebhookEvent {
 export interface GatewayHealthResult {
   healthy: boolean;
   latencyMs: number;
+}
+
+// Checkout action type
+// Determines how the checkout controller should handle a payment
+// - redirect: send 302 to external URL (Paytm)
+// - render: render HTML page with embedded SDK (Razorpay)
+
+export interface CheckoutAction {
+  /**
+  This abstraction allows each gateway plugin to decide how checkout should be initiated 
+  New gateways can introduce their own checkout flow by implementing
+  getCheckoutAction() without requiring any controller changes.
+   */
+
+  type: 'redirect' | 'render';
+  url?: string; // Required for 'redirect'
+  templateData?: Record<string, unknown>; // Required for 'render'
 }
 
 // GatewayPlugin interface
@@ -107,6 +129,16 @@ export interface GatewayPlugin {
     body: unknown,
     headers: Record<string, string | string[] | undefined>,
   ): WebhookEvent;
+
+  /**
+   * Determine checkout behavior for a payment.
+   * Receives full StoredPayment — plugin extracts what it needs.
+   * This keeps the plugin self-contained per Handbook §3.6.
+   *
+   * - Paytm returns { type: 'redirect', url: paymentUrl }
+   * - Razorpay returns { type: 'render', templateData: {...} }
+   */
+  getCheckoutAction(payment: StoredPayment): Promise<CheckoutAction> | CheckoutAction;
 
   // ping gateway to verify credentials and connectivity, use in initial getup validatoin and GET
 

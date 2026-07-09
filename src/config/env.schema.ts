@@ -79,6 +79,21 @@ const BaseEnvSchema = z.object({
   PAYU_MERCHANT_SALT: z.string().optional(),
   PAYU_WEBHOOK_SECRET: z.string().optional(),
 
+  // ── Paytm credentials ─────────────────────────────────────────────────────
+  PAYTM_MERCHANT_ID: z.string().optional(),
+  PAYTM_MERCHANT_KEY: z.string().optional(),
+  PAYTM_WEBHOOK_SECRET: z.string().optional(),
+
+  // Optional base URL override for Paytm.
+  // When set, the plugin uses this instead of the production Paytm API URL.
+  // Use this to point the plugin at your local mock server during development
+  // or CI without changing any other code.
+  //
+  // Example values:
+  //   production (default, omit this var): https://securegw.paytm.in
+  //   local mock server:                   http://localhost:9091
+  PAYTM_BASE_URL: z.string().url('PAYTM_BASE_URL must be a valid URL if provided').optional(),
+
   // ── Cashfree credentials ───────────────────────────────────────────────────
 
   CASHFREE_APP_ID: z.string().optional(),

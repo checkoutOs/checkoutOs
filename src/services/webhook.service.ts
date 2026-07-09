@@ -33,6 +33,39 @@ const log = createContextLogger('webhook-service');
 // Kept short: checkoutOs should not hold the gateway connection open waiting
 // for a slow downstream server.
 const RELAY_TIMEOUT_MS = 5_000;
+/**
+Payment gateways may resend old events or deliver webhooks in a different
+ * order than they occurred. Without this guard, a payment that has already
+ * reached a terminal state (e.g. SUCCESS) could be incorrectly overwritten
+ * by a later FAILED, CANCELLED, or PENDING event.
+ *
+ * Example:
+ *   PENDING -> PROCESSING -> SUCCESS   ✅ Allowed
+ *   SUCCESS -> FAILED                  ❌ Blocked
+ *   FAILED  -> SUCCESS                 ❌ Blocked
+ * 
+ * Refunds are handled as separate business events and must not modify the
+ * original payment lifecycle through normal status transitions.
+  */
+const VALID_TRANSITIONS: Record<string, string[]> = {
+  PENDING: ['PROCESSING', 'SUCCESS', 'FAILED', 'CANCELLED', 'EXPIRED'],
+  PROCESSING: ['SUCCESS', 'FAILED', 'CANCELLED', 'EXPIRED'],
+  SUCCESS: [],
+  FAILED: [],
+  CANCELLED: [],
+  EXPIRED: [],
+  REFUNDED: [],
+  PARTIALLY_REFUNDED: [],
+};
+
+function isValidTransition(from: string, to: string): boolean {
+  const allowed = VALID_TRANSITIONS[from];
+  if (!allowed) {
+    log.error('Unknown status in transition check', { from, to });
+    return false;
+  }
+  return allowed.includes(to);
+}
 
 // webhook.service.ts - Fixed processWebhook function
 
@@ -56,33 +89,51 @@ export async function processWebhook(
   // ✅ STEP 1: Try to find chkId by gatewayPaymentId
   let chkId = await findChkIdByGatewayId(gateway, event.gatewayPaymentId);
 
-  // ✅ STEP 2: FALLBACK - If not found, try to find by order_id from raw webhook
+  // ✅ STEP 2: FALLBACK - If not found, try alternative IDs
   if (chkId === null) {
-    // Extract order_id from the raw webhook payload
-    let orderId: string | undefined;
-
-    try {
-      const rawBody =
-        typeof body === 'string'
-          ? body
-          : Buffer.isBuffer(body)
-            ? body.toString('utf-8')
-            : JSON.stringify(body);
-      const rawWebhook = JSON.parse(rawBody);
-      orderId = rawWebhook?.payload?.payment?.entity?.order_id;
-    } catch {
-      // Ignore parsing errors
-    }
-
-    if (orderId) {
-      chkId = await findChkIdByGatewayId(gateway, orderId);
+    // First try: use gatewayOrderId if the plugin provided it (e.g. Paytm's ORDERID).
+    // Paytm stores payments with ORDERID as the lookup key at creation time,
+    // but webhooks carry TXNID as gatewayPaymentId — so TXNID won't be in Redis
+    // until the first webhook is processed. Using ORDERID as a fallback resolves this.
+    if (event.gatewayOrderId) {
+      chkId = await findChkIdByGatewayId(gateway, event.gatewayOrderId);
 
       if (chkId) {
-        log.info('Found payment via order_id fallback', {
-          orderId,
+        log.info('Found payment via gatewayOrderId fallback', {
+          gatewayOrderId: event.gatewayOrderId,
           chkId,
           gatewayPaymentId: event.gatewayPaymentId,
         });
+      }
+    }
+
+    // Second try: parse raw body for Razorpay-style order_id in JSON webhook
+    if (chkId === null) {
+      let orderId: string | undefined;
+
+      try {
+        const rawBody =
+          typeof body === 'string'
+            ? body
+            : Buffer.isBuffer(body)
+              ? body.toString('utf-8')
+              : JSON.stringify(body);
+        const rawWebhook = JSON.parse(rawBody);
+        orderId = rawWebhook?.payload?.payment?.entity?.order_id;
+      } catch {
+        // Ignore parsing errors
+      }
+
+      if (orderId) {
+        chkId = await findChkIdByGatewayId(gateway, orderId);
+
+        if (chkId) {
+          log.info('Found payment via order_id fallback', {
+            orderId,
+            chkId,
+            gatewayPaymentId: event.gatewayPaymentId,
+          });
+        }
       }
     }
   }
@@ -126,15 +177,28 @@ export async function processWebhook(
 
   // Update status if different
   if (event.status !== stored.status) {
-    await updatePaymentStatus(chkId, event.status);
-    paymentUpdated = true;
+    if (!isValidTransition(stored.status, event.status)) {
+      log.warn('Invalid status transition blocked by state machine guard', {
+        chkId,
+        gateway,
+        currentStatus: stored.status,
+        attemptedStatus: event.status,
+        event: event.event,
+        gatewayPaymentId: event.gatewayPaymentId,
+      });
+      // Do NOT throw — return silently to prevent gateway retry storms.
+      // Relay should still happen so the developer is aware of the event.
+    } else {
+      await updatePaymentStatus(chkId, event.status);
+      paymentUpdated = true;
 
-    log.info('Payment status updated from webhook', {
-      chkId,
-      oldStatus: stored.status,
-      newStatus: event.status,
-      event: event.event,
-    });
+      log.info('Payment status updated from webhook', {
+        chkId,
+        oldStatus: stored.status,
+        newStatus: event.status,
+        event: event.event,
+      });
+    }
   }
 
   if (!paymentUpdated) {

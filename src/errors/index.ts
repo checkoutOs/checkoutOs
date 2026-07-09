@@ -5,7 +5,14 @@ export {
   GatewayUnavailableError,
   GatewayInvalidSignatureError,
   GatewayMappingError,
+  RefundNotReadyError,
 } from './gateways.errors';
+
+export {
+  PaytmPhoneRequiredError,
+  PaytmChecksumFailedError,
+  PaytmWebhookParseError,
+} from './paytm.errors';
 
 export {
   PaymentNotFoundError,
