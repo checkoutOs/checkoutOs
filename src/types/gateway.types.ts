@@ -65,6 +65,10 @@ export interface GatewayRefundResult {
 export interface WebhookEvent {
   gateway: GatewayName;
   gatewayPaymentId: string; // use for Redis reverse look to find chk_
+  // Optional gateway order ID. Populated by plugins that have a separate
+  // order ID (e.g. Paytm's ORDERID). The webhook service uses this for
+  // fallback lookup when gatewayPaymentId is not yet in Redis (first webhook).
+  gatewayOrderId?: string;
   event: string;
   status: PaymentStatus;
   amount: number;
