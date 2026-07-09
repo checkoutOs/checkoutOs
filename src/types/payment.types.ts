@@ -128,10 +128,17 @@ export interface StoredPayment {
   amount: number;
   currency: Currency;
   status: PaymentStatus;
-  // Gateway-issued payment URL stored at creation time.
-  // Used by Paytm for redirect-based checkout (getCheckoutAction reads this).
-  // Empty / absent for Razorpay (uses embedded SDK, not a redirect URL).
-  paymentUrl?: string;
+  // Flexible container for gateway-specific data that has no universal meaning.
+  // Keeps the core schema stable as new gateways are added — each gateway
+  // writes only the keys it needs; absent gateways contribute nothing.
+  //
+  // Current consumers:
+  //   paytm → { paymentUrl: 'https://securegw.paytm.in/...' }
+  //     Used by getCheckoutAction() for the 302 redirect to Paytm's payment page.
+  //
+  // Razorpay: no gateway-specific metadata — field is absent entirely.
+  // Serialised as a JSON string in the Redis payment hash.
+  gatewayMetadata?: Record<string, string>;
   createdAt: string;
   updatedAt: string;
 }
