@@ -100,6 +100,52 @@ describe('savePayment + findPaymentByChkId', () => {
     expect(found).toBeNull();
   });
 
+  it('round-trips gatewayMetadata correctly (Paytm paymentUrl)', async () => {
+    const payment = makeStoredPayment({
+      chkId: 'chk_integtest00000000000000000011',
+      gateway: 'paytm',
+      gatewayMetadata: {
+        paymentUrl:
+          'https://securegw.paytm.in/theia/api/v1/showPaymentPage?mid=MID001&orderId=ORDER_001',
+      },
+    });
+
+    await savePayment(payment);
+    const found = await findPaymentByChkId(payment.chkId);
+
+    expect(found).not.toBeNull();
+    expect(found!.gatewayMetadata).toBeDefined();
+    expect(found!.gatewayMetadata?.['paymentUrl']).toBe(
+      'https://securegw.paytm.in/theia/api/v1/showPaymentPage?mid=MID001&orderId=ORDER_001',
+    );
+  });
+
+  it('omits gatewayMetadata when not provided (Razorpay payments)', async () => {
+    // The standard Razorpay fixture has no gatewayMetadata
+    const payment = makeStoredPayment({
+      chkId: 'chk_integtest00000000000000000012',
+    });
+
+    await savePayment(payment);
+    const found = await findPaymentByChkId(payment.chkId);
+
+    expect(found).not.toBeNull();
+    expect(found!.gatewayMetadata).toBeUndefined();
+  });
+
+  it('preserves all fields including gatewayMetadata through full round-trip', async () => {
+    const payment = makeStoredPayment({
+      chkId: 'chk_integtest00000000000000000013',
+      gateway: 'paytm',
+      gatewayMetadata: { paymentUrl: 'https://securegw.paytm.in/pay?order=TEST001' },
+    });
+
+    await savePayment(payment);
+    const found = await findPaymentByChkId(payment.chkId);
+
+    expect(found).toEqual(payment);
+  });
+
   it('overwrites an existing payment when saved again with same chkId', async () => {
     const payment = makeStoredPayment();
     await savePayment(payment);

@@ -54,14 +54,32 @@ function serialisePayment(payment: StoredPayment): Record<string, string> {
     amount: String(payment.amount),
     currency: payment.currency,
     status: payment.status,
-    // Only write paymentUrl when it has a value — omit empty hash fields.
-    ...(payment.paymentUrl ? { paymentUrl: payment.paymentUrl } : {}),
+    // gatewayMetadata is stored as a compact JSON string.
+    // Only written when the gateway contributed metadata (e.g. Paytm paymentUrl).
+    // Absent entirely for gateways that need no extra data (e.g. Razorpay).
+    ...(payment.gatewayMetadata && Object.keys(payment.gatewayMetadata).length > 0
+      ? { gatewayMetadata: JSON.stringify(payment.gatewayMetadata) }
+      : {}),
     createdAt: payment.createdAt,
     updatedAt: payment.updatedAt,
   };
 }
 
 function deserialisePayment(raw: Record<string, string>): StoredPayment {
+  // Parse gatewayMetadata from JSON string. Treat malformed JSON as absent —
+  // a corrupted metadata field must never prevent a payment from being read.
+  let gatewayMetadata: Record<string, string> | undefined;
+  if (raw['gatewayMetadata']) {
+    try {
+      const parsed: unknown = JSON.parse(raw['gatewayMetadata']);
+      if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        gatewayMetadata = parsed as Record<string, string>;
+      }
+    } catch {
+      // Silently ignore — malformed metadata does not block payment reads.
+    }
+  }
+
   return {
     chkId: raw['chkId'] ?? '',
     gatewayOrderId: raw['gatewayOrderId'] ?? '',
@@ -71,8 +89,7 @@ function deserialisePayment(raw: Record<string, string>): StoredPayment {
     amount: parseInt(raw['amount'] ?? '0', 10),
     currency: raw['currency'] as StoredPayment['currency'],
     status: raw['status'] as PaymentStatus,
-    // paymentUrl is only present when stored — absent for Razorpay payments.
-    ...(raw['paymentUrl'] ? { paymentUrl: raw['paymentUrl'] } : {}),
+    ...(gatewayMetadata !== undefined ? { gatewayMetadata } : {}),
     createdAt: raw['createdAt'] ?? '',
     updatedAt: raw['updatedAt'] ?? '',
   };

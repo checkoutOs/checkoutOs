@@ -506,18 +506,63 @@ describe('PaytmPlugin.getCheckoutAction', () => {
     expect(action.type).toBe('redirect');
   });
 
-  it('returns a URL containing the merchant ID and order ID', () => {
-    const action = plugin.getCheckoutAction(mockStoredPayment);
+  // ── Primary path: gatewayMetadata.paymentUrl ──────────────────────────────
+  // When the payment was created with Paytm, gatewayMetadata.paymentUrl is
+  // stored at creation time. getCheckoutAction() must read from there first.
 
-    expect(action.url).toBeDefined();
-    expect(action.url).toContain('ORDER_001');
-    expect(action.url).toContain('test_mid_001');
+  it('uses gatewayMetadata.paymentUrl as redirect URL when present', () => {
+    const storedUrl =
+      'https://securegw.paytm.in/theia/api/v1/showPaymentPage?mid=test_mid_001&orderId=ORDER_001&token=TKN_001';
+
+    const paymentWithMetadata = {
+      ...mockStoredPayment,
+      gatewayMetadata: { paymentUrl: storedUrl },
+    };
+
+    const action = plugin.getCheckoutAction(paymentWithMetadata);
+
+    expect(action.type).toBe('redirect');
+    expect(action.url).toBe(storedUrl);
   });
 
-  it('URL points to the Paytm payment page path', () => {
+  it('does not reconstruct URL when gatewayMetadata.paymentUrl is present', () => {
+    const storedUrl = 'https://securegw.paytm.in/stored-exact-url';
+
+    const paymentWithMetadata = {
+      ...mockStoredPayment,
+      gatewayMetadata: { paymentUrl: storedUrl },
+    };
+
+    const action = plugin.getCheckoutAction(paymentWithMetadata);
+
+    // Must be exactly the stored URL — not a reconstructed one
+    expect(action.url).toBe(storedUrl);
+    expect(action.url).not.toContain('showPaymentPage');
+  });
+
+  // ── Fallback path: reconstruct from gatewayOrderId ────────────────────────
+  // Handles records created before the gatewayMetadata field was introduced.
+
+  it('falls back to reconstructing URL from gatewayOrderId when gatewayMetadata is absent', () => {
+    // mockStoredPayment has no gatewayMetadata — triggers fallback
     const action = plugin.getCheckoutAction(mockStoredPayment);
 
+    expect(action.url).toContain('ORDER_001');
+    expect(action.url).toContain('test_mid_001');
     expect(action.url).toContain('showPaymentPage');
+  });
+
+  it('falls back when gatewayMetadata exists but paymentUrl key is missing', () => {
+    const paymentWithOtherMetadata = {
+      ...mockStoredPayment,
+      gatewayMetadata: { someOtherKey: 'someValue' }, // no paymentUrl
+    };
+
+    const action = plugin.getCheckoutAction(paymentWithOtherMetadata);
+
+    // Falls back to constructed URL
+    expect(action.url).toContain('showPaymentPage');
+    expect(action.url).toContain('ORDER_001');
   });
 });
 
