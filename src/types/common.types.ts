@@ -74,6 +74,36 @@ export interface HealthResponse {
 // Every AppError subclass must reference a value from this object —
 // never use raw strings in error constructors.
 
+export type IdempotencyStatus = 'IN_PROGRESS' | 'COMPLETED';
+
+export interface IdempotencyRecord {
+  requestHash: string;
+  status: IdempotencyStatus;
+  response?: unknown; // Omitted when status is IN_PROGRESS
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type IdempotencyCheckResult =
+  | { type: 'MISS' }
+  | { type: 'HIT'; response: unknown }
+  | { type: 'IN_PROGRESS' };
+
+export interface IdempotencyCheckParams {
+  key: string;
+  requestHash: string;
+}
+
+export interface IdempotencyCompleteParams {
+  key: string;
+  requestHash: string;
+  response: unknown;
+}
+
+export const IDEMPOTENCY_TTL_SECONDS = 86400; // 24 hours
+export const IDEMPOTENCY_STALE_TIMEOUT_MS = 30000; // 30 seconds
+export const IDEMPOTENCY_MAX_RETRIES = 3; // 3 retries
+
 export const ErrorCode = {
   // Payment errors
   PAYMENT_NOT_FOUND: 'PAYMENT_NOT_FOUND',
@@ -106,6 +136,12 @@ export const ErrorCode = {
   VALIDATION_ERROR: 'VALIDATION_ERROR',
   NOT_FOUND: 'NOT_FOUND',
   INTERNAL_ERROR: 'INTERNAL_ERROR',
+  IDEMPOTENCY_KEY_REUSED: 'IDEMPOTENCY_KEY_REUSED',
+  REQUEST_IN_PROGRESS: 'REQUEST_IN_PROGRESS',
+  MISSING_IDEMPOTENCY_KEY: 'MISSING_IDEMPOTENCY_KEY',
+  INVALID_IDEMPOTENCY_KEY: 'INVALID_IDEMPOTENCY_KEY',
+  ORDER_ID_AMOUNT_MISMATCH: 'ORDER_ID_AMOUNT_MISMATCH',
+  ORDER_ID_CURRENCY_MISMATCH: 'ORDER_ID_CURRENCY_MISMATCH',
 } as const;
 
 export type ErrorCodeValue = (typeof ErrorCode)[keyof typeof ErrorCode];
