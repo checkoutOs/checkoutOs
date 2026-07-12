@@ -25,4 +25,13 @@ export {
   RefundFailedError,
 } from './payment.errors';
 
+export {
+  IdempotencyKeyReusedError,
+  IdempotencyRequestInProgressError,
+  IdempotencyKeyMissingError,
+  IdempotencyKeyInvalidError,
+  OrderIdAmountMismatchError,
+  orderIdCurrencyMismatchError,
+} from './idempotency.errors';
+
 export { StoreError } from './store.errors';
