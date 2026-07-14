@@ -36,6 +36,10 @@ const Keys = {
   //   1. At creation with gatewayOrderId (order_XXXX)
   //   2. After webhook with gatewayPaymentId (pay_XXXX)
   gatewayLookup: (gateway: string, gwId: string): string => `chk:gw:${gateway}:${gwId}`,
+
+  // reverse lookup for idempotency fallback
+  // maps a merchant supplied orderId to the internal chk_ ID
+  orderLookup: (orderId: string): string => `chk:pay:by-order:${orderId}`,
 };
 
 // ---------------------------------------------------------------------------
@@ -118,6 +122,11 @@ export async function savePayment(payment: StoredPayment): Promise<void> {
     // Allows status polling via order_XXXX before webhook arrives.
     pipeline.set(Keys.gatewayLookup(payment.gateway, payment.gatewayOrderId), payment.chkId);
 
+    // Reverse lookup for orderId → chk_id.
+    // Enable orderId deduplication
+
+    pipeline.set(Keys.orderLookup(payment.orderId), payment.chkId);
+
     await pipeline.exec();
   } catch (err) {
     throw new StoreError(`savePayment:${payment.chkId}`, err);
@@ -158,6 +167,18 @@ export async function findChkIdByGatewayId(
     return chkId;
   } catch (err) {
     throw new StoreError(`findChkIdByGatewayId:${gateway}:${gatewayId}`, err);
+  }
+}
+
+export async function findPaymentByOrderId(orderId: string): Promise<StoredPayment | null> {
+  try {
+    const chkId = await redisClient.get(Keys.orderLookup(orderId));
+    if (!chkId) {
+      return null;
+    }
+    return await findPaymentByChkId(chkId);
+  } catch (err) {
+    throw new StoreError(`findPaymentByOrderId:${orderId}`, err);
   }
 }
 
