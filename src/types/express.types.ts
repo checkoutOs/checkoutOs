@@ -2,8 +2,8 @@ import 'express';
 
 declare module 'express' {
   interface Request {
-    idempotencyKey?: {
-      idempotencyKey: string;
+    idempotency?: {
+      key: string;
       requestHash: string;
     };
   }

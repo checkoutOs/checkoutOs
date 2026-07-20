@@ -1,5 +1,9 @@
 // errors/index.ts
+// Barrel re-exports for all AppError subclasses.
+// Ordered by domain: gateway → paytm → payment → idempotency → store.
+
 export { AppError } from './app.errors';
+
 export {
   GatewayTimeoutError,
   GatewayUnavailableError,
@@ -19,6 +23,8 @@ export {
   PaymentFailedError,
   PaymentCreationFailedError,
   InvalidAmountError,
+  OrderIdAmountMismatchError,
+  OrderIdCurrencyMismatchError,
   RefundNotAllowedError,
   RefundNotFoundError,
   RefundAmountExceedsPaymentError,
@@ -30,8 +36,6 @@ export {
   IdempotencyRequestInProgressError,
   IdempotencyKeyMissingError,
   IdempotencyKeyInvalidError,
-  OrderIdAmountMismatchError,
-  orderIdCurrencyMismatchError,
 } from './idempotency.errors';
 
 export { StoreError } from './store.errors';

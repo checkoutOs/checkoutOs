@@ -69,10 +69,16 @@ export interface HealthResponse {
   };
 }
 
-// Error codes
-// Centralized registry of all error code strings used in ApiErrorPayload.
-// Every AppError subclass must reference a value from this object —
-// never use raw strings in error constructors.
+// ---------------------------------------------------------------------------
+// Idempotency types
+// ---------------------------------------------------------------------------
+// Used by IdempotencyStore / IdempotencyService to deduplicate POST /payments
+// based on the Idempotency-Key header. Constants are grouped with the types
+// they configure so callers import them together.
+
+export const IDEMPOTENCY_TTL_SECONDS = 86400; // 24 hours
+export const IDEMPOTENCY_STALE_TIMEOUT_MS = 30000; // 30 seconds
+export const IDEMPOTENCY_MAX_RETRIES = 3;
 
 export type IdempotencyStatus = 'IN_PROGRESS' | 'COMPLETED';
 
@@ -100,9 +106,12 @@ export interface IdempotencyCompleteParams {
   response: unknown;
 }
 
-export const IDEMPOTENCY_TTL_SECONDS = 86400; // 24 hours
-export const IDEMPOTENCY_STALE_TIMEOUT_MS = 30000; // 30 seconds
-export const IDEMPOTENCY_MAX_RETRIES = 3; // 3 retries
+// ---------------------------------------------------------------------------
+// Error codes
+// ---------------------------------------------------------------------------
+// Centralized registry of all error code strings used in ApiErrorPayload.
+// Every AppError subclass must reference a value from this object —
+// never use raw strings in error constructors.
 
 export const ErrorCode = {
   // Payment errors
