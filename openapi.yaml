@@ -60,7 +60,27 @@ paths:
         After creation, redirect the user to `data.paymentUrl`. The gateway
         hosts the checkout page. When the user completes payment, the gateway
         fires a webhook to checkoutOs which updates the payment status.
+
+        Requests are idempotent: send a unique UUID key per logical payment.
+        Retrying with the same key and same payload replays the original
+        response; retrying with the same key but a different payload is
+        rejected. Keys are retained for 24 hours. A duplicate `orderId` with a
+        different amount or currency is rejected regardless of key.
       operationId: createPayment
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          description: |
+            Unique key for this logical payment. Use a UUID v4 generated once
+            per payment attempt and reused for every retry of that attempt.
+            The same key with a different payload returns 400
+            IDEMPOTENCY_KEY_REUSED. Omitting the header returns 400
+            MISSING_IDEMPOTENCY_KEY.
+          schema:
+            type: string
+            format: uuid
+          example: 3f7d2a1e-9c4b-4f6a-8d2e-1b5c7a9e3f01
       requestBody:
         required: true
         content:
@@ -108,18 +128,90 @@ paths:
                   orderId: order_abc123
                   createdAt: "2024-01-15T10:30:00.000Z"
         '400':
-          description: Invalid amount
+          description: |
+            Invalid request. Covers invalid amount, a missing or malformed
+            Idempotency-Key, and key reuse with a different payload.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ApiErrorResponse'
-              example:
-                success: false
-                error:
-                  code: INVALID_AMOUNT
-                  message: Amount must be a positive integer in paise (e.g. 50000 for ₹500)
-                  details:
-                    received: -100
+              examples:
+                invalid_amount:
+                  summary: Amount is not a positive integer
+                  value:
+                    success: false
+                    error:
+                      code: INVALID_AMOUNT
+                      message: Amount must be a positive integer in paise (e.g. 50000 for ₹500)
+                      details:
+                        received: -100
+                missing_idempotency_key:
+                  summary: Idempotency-Key header not sent
+                  value:
+                    success: false
+                    error:
+                      code: MISSING_IDEMPOTENCY_KEY
+                      message: Idempotency-Key header is required for this endpoint
+                      details: {}
+                invalid_idempotency_key:
+                  summary: Idempotency-Key is not a valid UUID
+                  value:
+                    success: false
+                    error:
+                      code: INVALID_IDEMPOTENCY_KEY
+                      message: 'Idempotency key "not-a-uuid" is invalid. Must be UUID v4 format.'
+                      details:
+                        key: not-a-uuid
+                idempotency_key_reused:
+                  summary: Same key reused with a different payload
+                  value:
+                    success: false
+                    error:
+                      code: IDEMPOTENCY_KEY_REUSED
+                      message: 'Idempotency key "3f7d2a1e-…" reused with different request payload'
+                      details:
+                        key: 3f7d2a1e-9c4b-4f6a-8d2e-1b5c7a9e3f01
+        '409':
+          description: |
+            Conflict. Either an identical request with this key is already in
+            progress (retry shortly; stale attempts auto-recover after 30 s),
+            or the orderId already exists with a different amount or currency.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiErrorResponse'
+              examples:
+                request_in_progress:
+                  summary: Another request with this Idempotency-Key is processing
+                  value:
+                    success: false
+                    error:
+                      code: REQUEST_IN_PROGRESS
+                      message: 'Request with idempotency key "3f7d2a1e-…" is already in progress'
+                      details:
+                        key: 3f7d2a1e-9c4b-4f6a-8d2e-1b5c7a9e3f01
+                order_amount_mismatch:
+                  summary: orderId exists with a different amount
+                  value:
+                    success: false
+                    error:
+                      code: ORDER_ID_AMOUNT_MISMATCH
+                      message: 'OrderId "order_abc123" already exists with amount 50000, cannot create with different amount 100000'
+                      details:
+                        orderId: order_abc123
+                        existingAmount: 50000
+                        newAmount: 100000
+                order_currency_mismatch:
+                  summary: orderId exists with a different currency
+                  value:
+                    success: false
+                    error:
+                      code: ORDER_ID_CURRENCY_MISMATCH
+                      message: 'OrderId "order_abc123" already exists with currency INR, cannot create with different currency USD'
+                      details:
+                        orderId: order_abc123
+                        existingCurrency: INR
+                        newCurrency: USD
         '502':
           $ref: '#/components/responses/GatewayError'
         '503':
