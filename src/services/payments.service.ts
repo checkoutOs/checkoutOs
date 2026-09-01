@@ -23,6 +23,8 @@ import {
   InvalidAmountError,
   RefundNotAllowedError,
   RefundAmountExceedsPaymentError,
+  OrderIdAmountMismatchError,
+  OrderIdCurrencyMismatchError,
 } from '../errors';
 import { PaymentStatus } from '../types/payment.types';
 import type {
@@ -34,6 +36,10 @@ import type {
 } from '../types/payment.types';
 
 import type { CreatePaymentParams } from '../types/gateway.types';
+
+import { checkIdempotency, completeIdempotency } from './idempotency.service';
+import { findPaymentByOrderId } from '../store/payment.store';
+import { IdempotencyRequestInProgressError } from '../errors';
 
 const log = createContextLogger('payment-service');
 
@@ -131,6 +137,137 @@ export async function createPayment(req: CreatePaymentRequest): Promise<PaymentR
     orderId: req.orderId,
     createdAt: timestamp,
   };
+}
+
+// ---------------------------------------------------------------------------
+// createPaymentWithIdempotency
+// ---------------------------------------------------------------------------
+// Main entry point for POST /payments. Wraps createPayment() with two layers
+// of duplicate protection:
+//
+//   1. Idempotency key (header-based, from middleware)
+//      - Same key + same body  → returns cached response (no double charge)
+//      - Same key + diff body  → 400 IdempotencyKeyReusedError
+//      - Parallel reqs same key → one wins, others get 409 IN_PROGRESS
+//      - Stale IN_PROGRESS (30s+) auto-recovered
+//
+//   2. OrderId dedup (payload-based, even without idempotency key)
+//      - Same orderId + same amount/currency  → returns existing payment
+//      - Same orderId + different amount     → 409 OrderIdAmountMismatchError
+//      - Same orderId + different currency   → 409 OrderIdCurrencyMismatchError
+//
+// After successful creation, completeIdempotency() marks the record COMPLETED.
+// That call is NEVER fatal — if it fails, the payment is still returned and
+// the record will be auto-recovered on the next retry (30s stale window).
+//
+// Signature accepts the raw CreatePaymentRequest plus an optional idempotency
+// descriptor (key + requestHash) that the middleware attaches to req.idempotency.
+
+export async function createPaymentWithIdempotency(
+  req: CreatePaymentRequest,
+  idempotency?: { key: string; requestHash: string },
+): Promise<PaymentResponse> {
+  // -----------------------------------------------------------------------
+  // Step 1: Idempotency check (only if middleware attached a key)
+  // -----------------------------------------------------------------------
+  if (idempotency) {
+    const checkResult = await checkIdempotency({
+      key: idempotency.key,
+      requestHash: idempotency.requestHash,
+    });
+
+    // HIT — return cached response from a prior successful request
+    if (checkResult.type === 'HIT') {
+      log.info('Idempotency HIT — returning cached payment', {
+        key: idempotency.key,
+      });
+      return checkResult.response as PaymentResponse;
+    }
+
+    // IN_PROGRESS — another request with this key is currently processing
+    if (checkResult.type === 'IN_PROGRESS') {
+      throw new IdempotencyRequestInProgressError(idempotency.key);
+    }
+
+    // MISS — fall through to create the payment
+  }
+
+  // -----------------------------------------------------------------------
+  // Step 2: OrderId dedup (catches duplicates even without idempotency key)
+  // -----------------------------------------------------------------------
+  const existingByOrderId = await findPaymentByOrderId(req.orderId);
+
+  if (existingByOrderId) {
+    // Validate amount matches
+    if (existingByOrderId.amount !== req.amount) {
+      log.error('orderId.amount_mismatch', {
+        orderId: req.orderId,
+        existingAmount: existingByOrderId.amount,
+        newAmount: req.amount,
+      });
+      throw new OrderIdAmountMismatchError(req.orderId, existingByOrderId.amount, req.amount);
+    }
+
+    // Validate currency matches
+    if (existingByOrderId.currency !== req.currency) {
+      log.error('orderId.currency_mismatch', {
+        orderId: req.orderId,
+        existingCurrency: existingByOrderId.currency,
+        newCurrency: req.currency,
+      });
+      throw new OrderIdCurrencyMismatchError(req.orderId, existingByOrderId.currency, req.currency);
+    }
+
+    // Same orderId, same amount, same currency — return existing payment
+    log.debug('orderId.dedup_hit', {
+      orderId: req.orderId,
+      chkId: existingByOrderId.chkId,
+    });
+
+    return {
+      paymentId: existingByOrderId.chkId,
+      paymentUrl: `${config.app.baseUrl}/checkout/${existingByOrderId.chkId}`,
+      status: existingByOrderId.status,
+      amount: existingByOrderId.amount,
+      currency: existingByOrderId.currency,
+      gateway: existingByOrderId.gateway,
+      orderId: existingByOrderId.orderId,
+      createdAt: existingByOrderId.createdAt,
+    };
+  }
+
+  // -----------------------------------------------------------------------
+  // Step 3: Create payment (delegate to existing createPayment)
+  // -----------------------------------------------------------------------
+  // All validation, gateway call, Redis save, and response building happen
+  // inside createPayment(). Keeping it as a separate function preserves the
+  // single source of truth for the create flow — tests that exercise
+  // createPayment() directly continue to work without modification.
+  const response = await createPayment(req);
+
+  // -----------------------------------------------------------------------
+  // Step 4: Complete idempotency (only if middleware attached a key)
+  //
+  // NEVER fails the response — the payment is already created and persisted.
+  // If completeIdempotency() fails, the stale recovery mechanism (30s
+  // timeout) will eventually recover the record on the next retry.
+  // -----------------------------------------------------------------------
+  if (idempotency) {
+    const completed = await completeIdempotency({
+      key: idempotency.key,
+      requestHash: idempotency.requestHash,
+      response,
+    });
+
+    if (!completed) {
+      log.warn('idempotency.complete_non_critical_failure', {
+        key: idempotency.key,
+        chkId: response.paymentId,
+      });
+    }
+  }
+
+  return response;
 }
 
 /*

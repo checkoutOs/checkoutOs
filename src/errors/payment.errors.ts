@@ -44,7 +44,39 @@ export class PaymentCreationFailedError extends AppError {
       ErrorCode.PAYMENT_CREATION_FAILED,
       reason ?? `Failed to create payment on ${gateway}`,
       { gateway },
-      false, // Not operationla - this is a system-level failure
+      false, // Not operational - this is a system-level failure
+    );
+  }
+}
+
+// OrderId already exists with a different amount.
+// Throw when the merchant reuses an orderId but the amount doesn't match the
+// existing stored payment. 409 because the new request conflicts with the prior
+// payment resource keyed by orderId — not a malformed input.
+export class OrderIdAmountMismatchError extends AppError {
+  readonly httpStatus = 409;
+
+  constructor(orderId: string, expectedAmount: number, newAmount: number) {
+    super(
+      ErrorCode.ORDER_ID_AMOUNT_MISMATCH,
+      `Order ID ${orderId} already exists with amount ${expectedAmount} paise,` +
+        ` cannot create with different amount ${newAmount} paise`,
+      { orderId, expectedAmount, newAmount },
+    );
+  }
+}
+
+// OrderId already exists with a different currency.
+// Throw when the merchant reuses an orderId but the currency doesn't match.
+export class OrderIdCurrencyMismatchError extends AppError {
+  readonly httpStatus = 409;
+
+  constructor(orderId: string, expectedCurrency: string, newCurrency: string) {
+    super(
+      ErrorCode.ORDER_ID_CURRENCY_MISMATCH,
+      `Order ID ${orderId} already exists with currency ${expectedCurrency},` +
+        ` cannot create with different currency ${newCurrency}`,
+      { orderId, expectedCurrency, newCurrency },
     );
   }
 }

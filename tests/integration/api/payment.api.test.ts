@@ -18,6 +18,7 @@
 
 import { describe, it, expect, beforeAll, vi } from 'vitest';
 import request from 'supertest';
+import { randomUUID } from 'crypto';
 import { createTestApp, registerTestGateway } from '../../helpers/app.helper';
 import { PaymentStatus } from '../../../src/types/payment.types';
 
@@ -94,13 +95,26 @@ const validPaymentBody = {
   orderId: 'dev_order_001',
 };
 
+// Helper: every POST /payments now requires an Idempotency-Key header (the
+// idempotencyMiddleware enforces it → 400 MISSING_IDEMPotency_KEY otherwise).
+// Each call gets a fresh UUID so that within a single test the create is
+// treated as a MISS rather than a cached HIT; the integration setup's
+// beforeEach flush wipes chk:* keys (including chk:idem:*) between tests so
+// cross-test contamination is not a concern.
+function freshIdempotencyKey(): string {
+  return randomUUID();
+}
+
 // ---------------------------------------------------------------------------
 // POST /payments
 // ---------------------------------------------------------------------------
 
 describe('POST /payments', () => {
   it('returns 201 with paymentId and paymentUrl on success', async () => {
-    const res = await request(app).post('/payments').send(validPaymentBody);
+    const res = await request(app)
+      .post('/payments')
+      .set('Idempotency-Key', freshIdempotencyKey())
+      .send(validPaymentBody);
 
     expect(res.status).toBe(201);
     expect(res.body.success).toBe(true);
@@ -110,7 +124,10 @@ describe('POST /payments', () => {
   });
 
   it('returns 201 with correct amount and currency', async () => {
-    const res = await request(app).post('/payments').send(validPaymentBody);
+    const res = await request(app)
+      .post('/payments')
+      .set('Idempotency-Key', freshIdempotencyKey())
+      .send(validPaymentBody);
 
     expect(res.status).toBe(201);
     expect(res.body.data.amount).toBe(50000);
@@ -120,6 +137,7 @@ describe('POST /payments', () => {
   it('returns 400 for zero amount', async () => {
     const res = await request(app)
       .post('/payments')
+      .set('Idempotency-Key', freshIdempotencyKey())
       .send({ ...validPaymentBody, amount: 0 });
 
     expect(res.status).toBe(400);
@@ -130,6 +148,7 @@ describe('POST /payments', () => {
   it('returns 400 for negative amount', async () => {
     const res = await request(app)
       .post('/payments')
+      .set('Idempotency-Key', freshIdempotencyKey())
       .send({ ...validPaymentBody, amount: -500 });
 
     expect(res.status).toBe(400);
@@ -139,6 +158,7 @@ describe('POST /payments', () => {
   it('returns 400 for non-integer amount', async () => {
     const res = await request(app)
       .post('/payments')
+      .set('Idempotency-Key', freshIdempotencyKey())
       .send({ ...validPaymentBody, amount: 499.99 });
 
     expect(res.status).toBe(400);
@@ -146,7 +166,10 @@ describe('POST /payments', () => {
   });
 
   it('response shape matches ApiSuccessResponse contract', async () => {
-    const res = await request(app).post('/payments').send(validPaymentBody);
+    const res = await request(app)
+      .post('/payments')
+      .set('Idempotency-Key', freshIdempotencyKey())
+      .send(validPaymentBody);
 
     expect(res.body).toHaveProperty('success', true);
     expect(res.body).toHaveProperty('data');
@@ -161,6 +184,7 @@ describe('POST /payments', () => {
   it('error shape matches ApiErrorResponse contract', async () => {
     const res = await request(app)
       .post('/payments')
+      .set('Idempotency-Key', freshIdempotencyKey())
       .send({ ...validPaymentBody, amount: 0 });
 
     expect(res.body).toHaveProperty('success', false);
@@ -177,7 +201,10 @@ describe('POST /payments', () => {
 describe('GET /payments/:chkId', () => {
   it('returns 200 with payment status for existing payment', async () => {
     // First create a payment to get a real chkId
-    const createRes = await request(app).post('/payments').send(validPaymentBody);
+    const createRes = await request(app)
+      .post('/payments')
+      .set('Idempotency-Key', freshIdempotencyKey())
+      .send(validPaymentBody);
 
     const chkId = createRes.body.data.paymentId;
 
@@ -198,7 +225,10 @@ describe('GET /payments/:chkId', () => {
   });
 
   it('returns correct response shape', async () => {
-    const createRes = await request(app).post('/payments').send(validPaymentBody);
+    const createRes = await request(app)
+      .post('/payments')
+      .set('Idempotency-Key', freshIdempotencyKey())
+      .send(validPaymentBody);
 
     const chkId = createRes.body.data.paymentId;
     const statusRes = await request(app).get(`/payments/${chkId}`);
@@ -219,7 +249,10 @@ describe('GET /payments/:chkId', () => {
 describe('POST /payments/:chkId/refund', () => {
   it('returns 422 when payment is in PENDING status (not refundable)', async () => {
     // Create payment — it starts as PENDING
-    const createRes = await request(app).post('/payments').send(validPaymentBody);
+    const createRes = await request(app)
+      .post('/payments')
+      .set('Idempotency-Key', freshIdempotencyKey())
+      .send(validPaymentBody);
 
     const chkId = createRes.body.data.paymentId;
 

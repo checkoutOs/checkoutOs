@@ -13,15 +13,29 @@
 import { Request, Response } from 'express';
 import { asyncHandler } from '../utils/asyncHandler';
 import { success } from '../utils/response';
-import { createPayment, getPaymentStatus } from '../services/payments.service';
+import { getPaymentStatus, createPaymentWithIdempotency } from '../services/payments.service';
 import { createRefund } from '../services/refunds.service';
 import type { CreatePaymentRequest, CreateRefundRequest } from '../types/payment.types';
+
+// Import express type augmentation so req.idempotency type-checks.
+// Side-effect import — no symbols used directly, but the `declare module
+// 'express'` block in express.types.ts adds the Request.idempotency field.
+import '../types/express.types';
 
 // ---------------------------------------------------------------------------
 // POST /payments
 // ---------------------------------------------------------------------------
 // Body: CreatePaymentRequest
+// Header: Idempotency-Key (required, UUID v4) — enforced by idempotencyMiddleware
 // Response: 201 + PaymentResponse
+//
+// Flow:
+//   1. idempotencyMiddleware reads header, validates UUID, computes hash,
+//      attaches { key, requestHash } to req.idempotency
+//   2. Controller extracts idempotency descriptor and forwards to the
+//      idempotency-aware service orchestrator
+//   3. createPaymentWithIdempotency handles HIT/MISS/IN_PROGRESS, OrderId
+//      dedup, and completeIdempotency
 //
 // Amount validation (positive integer in paise) happens in payment.service.
 // No pre-validation here — the service throws InvalidAmountError which the
@@ -29,7 +43,11 @@ import type { CreatePaymentRequest, CreateRefundRequest } from '../types/payment
 
 export const create = asyncHandler(
   async (req: Request<object, unknown, CreatePaymentRequest>, res: Response): Promise<void> => {
-    const result = await createPayment(req.body);
+    // req.idempotency is set by idempotencyMiddleware; if absent (e.g. route
+    // was registered without the middleware), the service still works in
+    // orderId-dedup-only mode. This keeps the contract resilient: a missing
+    // middleware is a deploy bug, not a crash.
+    const result = await createPaymentWithIdempotency(req.body, req.idempotency);
     res.status(201).json(success(result));
   },
 );
