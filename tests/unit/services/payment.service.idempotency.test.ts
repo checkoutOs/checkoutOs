@@ -2,6 +2,8 @@
 // Tests for createPaymentWithIdempotency() orchestration.
 //
 // Business invariants protected:
+//   - Validation runs BEFORE the key is claimed, so a rejected payload never
+//     strands a key that the corrected retry would then be refused for
 //   - A HIT short-circuits before any orderId lookup or gateway call
 //   - A fresh IN_PROGRESS record surfaces as IdempotencyRequestInProgressError
 //   - The orderId-dedup path completes the idempotency record (regression:
@@ -9,11 +11,19 @@
 //     could never be replayed as a HIT)
 //   - The create path still completes the record
 //   - completeIdempotency() failure never breaks the payment response
+//   - Pre-gateway rejections release the claim; anything from the gateway call
+//     onward HOLDS it, because an order may exist and a released key would let
+//     the retry create a second one
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { PaymentStatus } from '../../../src/types/payment.types';
 import type { StoredPayment } from '../../../src/types/payment.types';
-import { IdempotencyRequestInProgressError, OrderIdAmountMismatchError } from '../../../src/errors';
+import {
+  IdempotencyRequestInProgressError,
+  InvalidAmountError,
+  OrderIdAmountMismatchError,
+  OrderIdCurrencyMismatchError,
+} from '../../../src/errors';
 
 // ---------------------------------------------------------------------------
 // Mock all external dependencies
@@ -36,6 +46,7 @@ vi.mock('../../../src/store/refund.store', () => ({
 vi.mock('../../../src/services/idempotency.service', () => ({
   checkIdempotency: vi.fn(),
   completeIdempotency: vi.fn().mockResolvedValue(true),
+  releaseIdempotency: vi.fn().mockResolvedValue(true),
 }));
 
 vi.mock('../../../src/gateways/gateway.registry', () => ({
@@ -75,8 +86,12 @@ vi.mock('../../../src/utils/id', () => ({
 // ---------------------------------------------------------------------------
 
 import { createPaymentWithIdempotency } from '../../../src/services/payments.service';
-import { findPaymentByOrderId } from '../../../src/store/payment.store';
-import { checkIdempotency, completeIdempotency } from '../../../src/services/idempotency.service';
+import { findPaymentByOrderId, savePayment } from '../../../src/store/payment.store';
+import {
+  checkIdempotency,
+  completeIdempotency,
+  releaseIdempotency,
+} from '../../../src/services/idempotency.service';
 import { getActiveGateway } from '../../../src/gateways/gateway.registry';
 
 // ---------------------------------------------------------------------------
@@ -123,6 +138,34 @@ function mockGatewayCreate(): void {
 beforeEach(() => {
   vi.clearAllMocks();
   vi.mocked(completeIdempotency).mockResolvedValue(true);
+  vi.mocked(releaseIdempotency).mockResolvedValue(true);
+});
+
+// ---------------------------------------------------------------------------
+// Validation runs before the key is claimed
+// ---------------------------------------------------------------------------
+
+describe('createPaymentWithIdempotency — validation ordering', () => {
+  it('rejects an invalid amount without ever claiming the idempotency key', async () => {
+    await expect(
+      createPaymentWithIdempotency({ ...REQUEST, amount: -1 }, IDEMPOTENCY),
+    ).rejects.toThrow(InvalidAmountError);
+
+    // checkIdempotency() writes an IN_PROGRESS record as the side effect of a
+    // MISS. Validating first means a rejected payload never takes the key —
+    // so the corrected retry is not refused as IDEMPOTENCY_KEY_REUSED.
+    expect(checkIdempotency).not.toHaveBeenCalled();
+    // Nothing was claimed, so there is nothing to release.
+    expect(releaseIdempotency).not.toHaveBeenCalled();
+  });
+
+  it.each([0, -100, 1.5, Number.NaN])('rejects amount %s before claiming', async (amount) => {
+    await expect(createPaymentWithIdempotency({ ...REQUEST, amount }, IDEMPOTENCY)).rejects.toThrow(
+      InvalidAmountError,
+    );
+
+    expect(checkIdempotency).not.toHaveBeenCalled();
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -200,12 +243,35 @@ describe('createPaymentWithIdempotency — orderId dedup path', () => {
     expect(completeIdempotency).not.toHaveBeenCalled();
   });
 
-  it('does not complete the record when the orderId collides with a different amount', async () => {
+  it('releases rather than completes the claim when the orderId collides on amount', async () => {
     await expect(
       createPaymentWithIdempotency({ ...REQUEST, amount: 100000 }, IDEMPOTENCY),
     ).rejects.toThrow(OrderIdAmountMismatchError);
 
+    // A rejection is never cached under the key...
     expect(completeIdempotency).not.toHaveBeenCalled();
+    // ...but the claim is handed back, since no gateway call was made. The
+    // client's retry gets the real 409 instead of REQUEST_IN_PROGRESS.
+    expect(releaseIdempotency).toHaveBeenCalledWith({
+      key: IDEMPOTENCY.key,
+      requestHash: IDEMPOTENCY.requestHash,
+    });
+  });
+
+  it('releases the claim when the orderId collides on currency', async () => {
+    await expect(
+      createPaymentWithIdempotency({ ...REQUEST, currency: 'USD' as never }, IDEMPOTENCY),
+    ).rejects.toThrow(OrderIdCurrencyMismatchError);
+
+    expect(releaseIdempotency).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not attempt a release when no idempotency key was supplied', async () => {
+    await expect(createPaymentWithIdempotency({ ...REQUEST, amount: 100000 })).rejects.toThrow(
+      OrderIdAmountMismatchError,
+    );
+
+    expect(releaseIdempotency).not.toHaveBeenCalled();
   });
 
   it('returns the payment even when completeIdempotency() fails', async () => {
@@ -246,5 +312,32 @@ describe('createPaymentWithIdempotency — create path', () => {
     const result = await createPaymentWithIdempotency(REQUEST, IDEMPOTENCY);
 
     expect(result.paymentId).toBe('chk_freshpaymentid1234567890123');
+  });
+
+  it('HOLDS the claim when the gateway call fails — releasing could double-charge', async () => {
+    vi.mocked(getActiveGateway).mockReturnValue({
+      createPayment: vi.fn().mockRejectedValue(new Error('gateway exploded')),
+    } as never);
+
+    await expect(createPaymentWithIdempotency(REQUEST, IDEMPOTENCY)).rejects.toThrow(
+      'gateway exploded',
+    );
+
+    // Once plugin.createPayment() has been invoked an order may exist at the
+    // gateway even though the call reported an error. Handing the key back
+    // would let the retry create a second order, so the claim is held and the
+    // 30s stale window governs recovery instead.
+    expect(releaseIdempotency).not.toHaveBeenCalled();
+    expect(completeIdempotency).not.toHaveBeenCalled();
+  });
+
+  it('HOLDS the claim when persistence fails after a successful gateway call', async () => {
+    vi.mocked(savePayment).mockRejectedValueOnce(new Error('redis down'));
+
+    await expect(createPaymentWithIdempotency(REQUEST, IDEMPOTENCY)).rejects.toThrow('redis down');
+
+    // The gateway order exists but was never persisted — the most dangerous
+    // moment to hand the key back.
+    expect(releaseIdempotency).not.toHaveBeenCalled();
   });
 });

@@ -65,6 +65,36 @@ redis.call("SET", key, newValue, "EX", ttl)
 return 1
 `;
 
+// Lua: atomic claim release — deletes the record ONLY when it is still the
+// IN_PROGRESS record the caller created (status AND requestHash both match).
+// Returns 1 if deleted, 0 otherwise (missing, COMPLETED, or owned by another
+// request whose hash differs).
+//
+// The requestHash guard is what makes this safe to call from a catch block:
+// if the caller's record was already recovered as stale and re-claimed by a
+// different request, that record carries a different hash and is left alone.
+const DELETE_IF_IN_PROGRESS_SCRIPT = `
+local key = KEYS[1]
+local expectedHash = ARGV[1]
+
+local existing = redis.call("GET", key)
+if not existing then
+    return 0
+end
+
+local ok, rec = pcall(cjson.decode, existing)
+if not ok or rec == nil then
+    return 0
+end
+
+if rec.status ~= "IN_PROGRESS" or rec.requestHash ~= expectedHash then
+    return 0
+end
+
+redis.call("DEL", key)
+return 1
+`;
+
 function serialise(record: IdempotencyRecord): string {
   return JSON.stringify(record);
 }
@@ -149,5 +179,26 @@ export async function forceUpdateIfInProgress(
     return result === 1;
   } catch (err) {
     throw new StoreError(`forceUpdateIfInProgress:${key}`, err);
+  }
+}
+
+// Atomically release an unfulfilled claim. Used by IdempotencyService when a
+// request that took the key fails before anything was created at the gateway —
+// the key becomes immediately reusable instead of blocking retries for the
+// full stale window.
+//
+// Deletes only when status is IN_PROGRESS AND requestHash matches, so a record
+// that has since completed or been re-claimed by another request is untouched.
+export async function deleteIfInProgress(key: string, requestHash: string): Promise<boolean> {
+  try {
+    const result = await redisClient.eval(
+      DELETE_IF_IN_PROGRESS_SCRIPT,
+      1,
+      buildKey(key),
+      requestHash,
+    );
+    return result === 1;
+  } catch (err) {
+    throw new StoreError(`deleteIfInProgress:${key}`, err);
   }
 }

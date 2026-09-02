@@ -26,6 +26,7 @@ import {
   setIdempotencyRecordIfNotExists,
   updateIdempotencyRecord,
   forceUpdateIfInProgress,
+  deleteIfInProgress,
 } from '../../../src/store/idempotency.store';
 import { StoreError } from '../../../src/errors/store.errors';
 import type { IdempotencyRecord } from '../../../src/types/common.types';
@@ -211,5 +212,52 @@ describe('forceUpdateIfInProgress', () => {
   it('wraps ioredis failures in StoreError', async () => {
     vi.spyOn(redisClient, 'eval').mockRejectedValue(new Error('NOSCRIPT'));
     await expect(forceUpdateIfInProgress('any-key', makeRecord())).rejects.toThrow(StoreError);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// deleteIfInProgress — releasing an unfulfilled claim
+// ---------------------------------------------------------------------------
+// Same ioredis-mock limitation as forceUpdateIfInProgress: no cjson, so the
+// script body cannot execute here. Wrapper contract is asserted below; the
+// real Lua guards run against real Redis in tests/integration/idempotency.test.ts.
+
+describe('deleteIfInProgress', () => {
+  it('returns true when the Lua guard allows the delete', async () => {
+    const evalSpy = vi.spyOn(redisClient, 'eval').mockResolvedValue(1);
+
+    const result = await deleteIfInProgress('key-del-1', 'hash_default_abc123');
+
+    expect(result).toBe(true);
+    const args = evalSpy.mock.calls[0] as unknown[];
+    expect(args[0]).toContain('DEL'); // the delete script, not the update one
+    expect(args[1]).toBe(1); // KEYS count
+    expect(args[2]).toBe('chk:idem:key-del-1'); // buildKey prefix applied
+    expect(args[3]).toBe('hash_default_abc123'); // hash passed as the guard arg
+  });
+
+  it('returns false when the guard blocks the delete', async () => {
+    vi.spyOn(redisClient, 'eval').mockResolvedValue(0);
+
+    // Guard blocks on: missing key, COMPLETED status, or a hash belonging to
+    // another request. Releasing any of those would drop a claim we do not own.
+    const result = await deleteIfInProgress('key-del-foreign', 'some_other_hash');
+
+    expect(result).toBe(false);
+  });
+
+  it('sends the requestHash so a foreign record can never be released', async () => {
+    const evalSpy = vi.spyOn(redisClient, 'eval').mockResolvedValue(0);
+
+    await deleteIfInProgress('key-del-2', 'hash_owned_by_caller');
+
+    const script = String((evalSpy.mock.calls[0] as unknown[])[0]);
+    expect(script).toContain('rec.requestHash ~= expectedHash');
+    expect(script).toContain('rec.status ~= "IN_PROGRESS"');
+  });
+
+  it('wraps ioredis failures in StoreError', async () => {
+    vi.spyOn(redisClient, 'eval').mockRejectedValue(new Error('NOSCRIPT'));
+    await expect(deleteIfInProgress('any-key', 'any-hash')).rejects.toThrow(StoreError);
   });
 });

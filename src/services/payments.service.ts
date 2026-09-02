@@ -37,7 +37,7 @@ import type {
 
 import type { CreatePaymentParams } from '../types/gateway.types';
 
-import { checkIdempotency, completeIdempotency } from './idempotency.service';
+import { checkIdempotency, completeIdempotency, releaseIdempotency } from './idempotency.service';
 import { findPaymentByOrderId } from '../store/payment.store';
 import { IdempotencyRequestInProgressError } from '../errors';
 
@@ -57,18 +57,33 @@ const TERMINAL_STATUSES = new Set<PaymentStatus>([
   PaymentStatus.EXPIRED,
 ]);
 
+// ---------------------------------------------------------------------------
+// validateCreatePaymentRequest
+// ---------------------------------------------------------------------------
+// Pure request validation — no store or gateway access, so it is safe to run
+// before an idempotency key is claimed. createPaymentWithIdempotency() calls
+// it up front for exactly that reason; createPayment() calls it too so direct
+// callers keep the same contract. Running twice is harmless.
+//
+// Note: orderId and currency are not validated here yet (BUG-003) — this is
+// where that check belongs when it lands.
+
+function validateCreatePaymentRequest(req: CreatePaymentRequest): void {
+  if (typeof req.amount !== 'number' || !Number.isInteger(req.amount) || req.amount <= 0) {
+    throw new InvalidAmountError(req.amount);
+  }
+}
+
 /*
 1) Validate amount
 2) call gateway.createPayment();
 3) Generate chk_ID
-4) save StorePayment to Redis gatewayPaymentId empty 
+4) save StorePayment to Redis gatewayPaymentId empty
 5) Return PaymentResponse
 */
 
 export async function createPayment(req: CreatePaymentRequest): Promise<PaymentResponse> {
-  if (typeof req.amount !== 'number' || !Number.isInteger(req.amount) || req.amount <= 0) {
-    throw new InvalidAmountError(req.amount);
-  }
+  validateCreatePaymentRequest(req);
 
   const plugin = getActiveGateway();
 
@@ -163,10 +178,56 @@ export async function createPayment(req: CreatePaymentRequest): Promise<PaymentR
 // Signature accepts the raw CreatePaymentRequest plus an optional idempotency
 // descriptor (key + requestHash) that the middleware attaches to req.idempotency.
 
+// Release the claim taken in Step 1, for rejections that happen before the
+// gateway is called. No-op when the request carried no idempotency key.
+//
+// Release is deliberately NOT attempted for failures inside createPayment():
+// once plugin.createPayment() has been invoked, an order may exist at the
+// gateway even if the call reported an error (a timeout, a dropped connection,
+// or a store failure after a successful create). Plugins surface several of
+// those as the same PaymentCreationFailedError, so the error type cannot prove
+// the gateway was untouched. Holding the claim costs the client one stale
+// window; releasing it wrongly costs a duplicate order.
+async function releaseClaim(
+  idempotency: { key: string; requestHash: string } | undefined,
+  reason: string,
+): Promise<void> {
+  if (!idempotency) {
+    return;
+  }
+
+  // Never throws — the caller is about to surface the real error.
+  const released = await releaseIdempotency({
+    key: idempotency.key,
+    requestHash: idempotency.requestHash,
+  });
+
+  log.debug('idempotency.claim_release_attempted', {
+    key: idempotency.key,
+    reason,
+    released,
+  });
+}
+
 export async function createPaymentWithIdempotency(
   req: CreatePaymentRequest,
   idempotency?: { key: string; requestHash: string },
 ): Promise<PaymentResponse> {
+  // -----------------------------------------------------------------------
+  // Step 0: Validate BEFORE the idempotency key is claimed
+  // -----------------------------------------------------------------------
+  // checkIdempotency() writes an IN_PROGRESS record as the side effect of a
+  // MISS, so anything that throws after it has claimed the key.
+  //
+  // Validating first keeps a malformed request from ever taking a key. When
+  // this ran later (inside createPayment), a rejected request left the key
+  // claimed against its bad-payload hash — and the corrected retry carried a
+  // different body, so checkIdempotency() saw a hash mismatch and answered
+  // IDEMPOTENCY_KEY_REUSED. Because the hash check precedes the staleness
+  // check, stale recovery could never clear it: the key stayed unusable for
+  // its full 24h TTL and the client had to mint a new one.
+  validateCreatePaymentRequest(req);
+
   // -----------------------------------------------------------------------
   // Step 1: Idempotency check (only if middleware attached a key)
   // -----------------------------------------------------------------------
@@ -213,6 +274,7 @@ export async function createPaymentWithIdempotency(
         existingAmount: existingByOrderId.amount,
         newAmount: req.amount,
       });
+      await releaseClaim(idempotency, 'orderId.amount_mismatch');
       throw new OrderIdAmountMismatchError(req.orderId, existingByOrderId.amount, req.amount);
     }
 
@@ -223,6 +285,7 @@ export async function createPaymentWithIdempotency(
         existingCurrency: existingByOrderId.currency,
         newCurrency: req.currency,
       });
+      await releaseClaim(idempotency, 'orderId.currency_mismatch');
       throw new OrderIdCurrencyMismatchError(req.orderId, existingByOrderId.currency, req.currency);
     }
 

@@ -12,10 +12,15 @@
 //   - Race retries are bounded by IDEMPOTENCY_MAX_RETRIES, then IN_PROGRESS
 //   - Stale IN_PROGRESS recovers via forceUpdateIfInProgress (atomic)
 //   - completeIdempotency NEVER throws and never overwrites a foreign record
+//   - releaseIdempotency NEVER throws and only releases the caller's own claim
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import * as IdempotencyStore from '../../../src/store/idempotency.store';
-import { checkIdempotency, completeIdempotency } from '../../../src/services/idempotency.service';
+import {
+  checkIdempotency,
+  completeIdempotency,
+  releaseIdempotency,
+} from '../../../src/services/idempotency.service';
 import { IdempotencyKeyReusedError } from '../../../src/errors/idempotency.errors';
 import type { IdempotencyRecord } from '../../../src/types/common.types';
 
@@ -51,6 +56,7 @@ function spyOnStore(): void {
   vi.spyOn(IdempotencyStore, 'setIdempotencyRecordIfNotExists').mockResolvedValue(true);
   vi.spyOn(IdempotencyStore, 'updateIdempotencyRecord').mockResolvedValue(true);
   vi.spyOn(IdempotencyStore, 'forceUpdateIfInProgress').mockResolvedValue(true);
+  vi.spyOn(IdempotencyStore, 'deleteIfInProgress').mockResolvedValue(true);
 }
 
 beforeEach(() => {
@@ -222,5 +228,44 @@ describe('completeIdempotency', () => {
       false,
     );
     expect(updateSpy).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// releaseIdempotency
+// ---------------------------------------------------------------------------
+
+describe('releaseIdempotency', () => {
+  it('releases the claim and reports success', async () => {
+    const spy = vi.spyOn(IdempotencyStore, 'deleteIfInProgress').mockResolvedValue(true);
+
+    const released = await releaseIdempotency({ key: KEY, requestHash: HASH });
+
+    expect(released).toBe(true);
+    // The hash is forwarded so the store can refuse to drop a foreign claim.
+    expect(spy).toHaveBeenCalledWith(KEY, HASH);
+  });
+
+  it('reports false when the store guard refuses the release', async () => {
+    vi.spyOn(IdempotencyStore, 'deleteIfInProgress').mockResolvedValue(false);
+
+    // Record already COMPLETED, expired, or re-claimed by another request —
+    // not an error, just nothing to release.
+    await expect(releaseIdempotency({ key: KEY, requestHash: HASH })).resolves.toBe(false);
+  });
+
+  it('never throws — a store failure must not mask the original error', async () => {
+    vi.spyOn(IdempotencyStore, 'deleteIfInProgress').mockRejectedValue(new Error('redis down'));
+
+    // The caller is already unwinding a real error; a cleanup failure must not
+    // replace it. The 30s stale window still recovers the record.
+    await expect(releaseIdempotency({ key: KEY, requestHash: HASH })).resolves.toBe(false);
+  });
+
+  it('never completes or overwrites the record while releasing', async () => {
+    await releaseIdempotency({ key: KEY, requestHash: HASH });
+
+    expect(IdempotencyStore.updateIdempotencyRecord).not.toHaveBeenCalled();
+    expect(IdempotencyStore.setIdempotencyRecordIfNotExists).not.toHaveBeenCalled();
   });
 });

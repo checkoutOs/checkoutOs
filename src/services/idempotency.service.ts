@@ -21,6 +21,7 @@ import {
   type IdempotencyCheckResult,
   type IdempotencyCompleteParams,
   type IdempotencyRecord,
+  type IdempotencyReleaseParams,
 } from '../types/common.types';
 
 const log = createContextLogger('idempotency-service');
@@ -135,6 +136,46 @@ export async function checkIdempotency(
   // The client may retry after the stale timeout window (30s) for auto-recovery.
   log.error('idempotency.race_condition_retry_exhausted', { key });
   return { type: 'IN_PROGRESS' };
+}
+
+// Release a claim taken by checkIdempotency() when the request that took it
+// failed WITHOUT creating anything at the gateway.
+//
+// checkIdempotency() writes an IN_PROGRESS record as the side effect of a MISS.
+// If the caller then fails, that record would otherwise sit claimed until the
+// 30s stale window elapses, and every retry in between gets a 409 for a request
+// that is not actually running. Releasing makes the key immediately reusable.
+//
+// Only ever call this when the gateway was provably never invoked. If a gateway
+// call was attempted — even one that appeared to fail — an order may exist, and
+// releasing the key would let a retry create a second one. Holding the claim is
+// the safe default in that case.
+//
+// Never throws: the caller is already unwinding an error and must surface that
+// error, not a secondary failure from cleanup. A failed release is not fatal —
+// the stale window still recovers the record after 30s.
+export async function releaseIdempotency(params: IdempotencyReleaseParams): Promise<boolean> {
+  const { key, requestHash } = params;
+
+  try {
+    const released = await IdempotencyStore.deleteIfInProgress(key, requestHash);
+
+    if (released) {
+      log.info('idempotency.released', { key });
+    } else {
+      // Not an error: the record may have completed, expired, or been
+      // re-claimed by another request after a stale recovery.
+      log.debug('idempotency.release_skipped', { key });
+    }
+
+    return released;
+  } catch (err) {
+    log.error('idempotency.release_failure', {
+      key,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return false;
+  }
 }
 
 // Mark the idempotency request as COMPLETED with the payment response.

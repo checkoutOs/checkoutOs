@@ -106,6 +106,13 @@ export interface IdempotencyCompleteParams {
   response: unknown;
 }
 
+// Releasing an unfulfilled claim. requestHash is required so a caller can
+// only release the record it created — never one belonging to another request.
+export interface IdempotencyReleaseParams {
+  key: string;
+  requestHash: string;
+}
+
 // ---------------------------------------------------------------------------
 // Error codes
 // ---------------------------------------------------------------------------
