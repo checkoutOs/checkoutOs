@@ -197,6 +197,14 @@ export async function createPaymentWithIdempotency(
   // -----------------------------------------------------------------------
   const existingByOrderId = await findPaymentByOrderId(req.orderId);
 
+  // Both branches below assign `response` and fall through to Step 4 — they
+  // never return early. Returning directly from the dedup branch would skip
+  // completeIdempotency() and strand the record created by checkIdempotency()
+  // as IN_PROGRESS: the caller gets a 201, but the same key replayed inside
+  // the 30s stale window gets a 409, and after the window it recovers to MISS
+  // and dedups again — so the key could never become a HIT.
+  let response: PaymentResponse;
+
   if (existingByOrderId) {
     // Validate amount matches
     if (existingByOrderId.amount !== req.amount) {
@@ -218,13 +226,13 @@ export async function createPaymentWithIdempotency(
       throw new OrderIdCurrencyMismatchError(req.orderId, existingByOrderId.currency, req.currency);
     }
 
-    // Same orderId, same amount, same currency — return existing payment
+    // Same orderId, same amount, same currency — serve the existing payment
     log.debug('orderId.dedup_hit', {
       orderId: req.orderId,
       chkId: existingByOrderId.chkId,
     });
 
-    return {
+    response = {
       paymentId: existingByOrderId.chkId,
       paymentUrl: `${config.app.baseUrl}/checkout/${existingByOrderId.chkId}`,
       status: existingByOrderId.status,
@@ -234,19 +242,22 @@ export async function createPaymentWithIdempotency(
       orderId: existingByOrderId.orderId,
       createdAt: existingByOrderId.createdAt,
     };
+  } else {
+    // ---------------------------------------------------------------------
+    // Step 3: Create payment (delegate to existing createPayment)
+    // ---------------------------------------------------------------------
+    // All validation, gateway call, Redis save, and response building happen
+    // inside createPayment(). Keeping it as a separate function preserves the
+    // single source of truth for the create flow — tests that exercise
+    // createPayment() directly continue to work without modification.
+    response = await createPayment(req);
   }
 
   // -----------------------------------------------------------------------
-  // Step 3: Create payment (delegate to existing createPayment)
-  // -----------------------------------------------------------------------
-  // All validation, gateway call, Redis save, and response building happen
-  // inside createPayment(). Keeping it as a separate function preserves the
-  // single source of truth for the create flow — tests that exercise
-  // createPayment() directly continue to work without modification.
-  const response = await createPayment(req);
-
-  // -----------------------------------------------------------------------
   // Step 4: Complete idempotency (only if middleware attached a key)
+  //
+  // Runs for BOTH paths above — a deduped response is cached under this key
+  // just like a freshly created one, so replaying the key returns a HIT.
   //
   // NEVER fails the response — the payment is already created and persisted.
   // If completeIdempotency() fails, the stale recovery mechanism (30s
