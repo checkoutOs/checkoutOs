@@ -50,6 +50,12 @@ function makeRecord(overrides: Partial<IdempotencyRecord> = {}): IdempotencyReco
 // returns 'OK', second returns null, original value preserved).
 // NOTE: plain property assignment, not vi.spyOn — ioredis-mock defines no
 // `call` property at all, so there is nothing for spyOn to wrap.
+//
+// Argument order differs from the production call on purpose. Redis accepts
+// the NX and expiry tokens in either order, but ioredis only types
+// expiry-first — `set(key, value, 'EX', ttl, 'NX')` has an overload while
+// `set(key, value, 'NX', 'EX', ttl)` does not, and falls through to the
+// KEEPTTL overload (TS2769). Same command on the wire either way.
 function delegateCallToSet(): void {
   const client = redisClient as unknown as Record<string, unknown>;
   client['call'] = async (...args: unknown[]) => {
@@ -57,7 +63,7 @@ function delegateCallToSet(): void {
     if (cmd !== 'SET') {
       throw new Error(`delegateCallToSet received unexpected command: ${cmd}`);
     }
-    return await redisClient.set(key, value, 'NX', 'EX', ttl);
+    return await redisClient.set(key, value, 'EX', ttl, 'NX');
   };
 }
 
