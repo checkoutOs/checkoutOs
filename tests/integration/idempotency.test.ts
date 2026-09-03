@@ -16,10 +16,11 @@
 // creation, but the actual controller contract is 201 Created — tests here
 // assert 201.
 //
-// NOTE on request hashing: the router is mounted at app.use('/payments', ...)
-// so inside idempotencyMiddleware req.path === '/'. Scenario (h) seeds Redis
-// directly and must reproduce the middleware's exact hash:
-//   generateRequestHash('POST', '/', body)
+// NOTE on request hashing: the middleware hashes the mount-aware path
+// (req.baseUrl + req.path), so a request to POST /payments hashes as
+// '/payments' — not the router-relative '/'. Scenario (h) seeds Redis directly
+// and must reproduce the middleware's exact hash:
+//   generateRequestHash('POST', '/payments', body)
 //
 // Business invariants protected (plan §1.4 success criteria):
 //   - Same request twice returns the same response
@@ -201,7 +202,7 @@ describe('POST /payments — idempotency', () => {
 
     // Simulate a crashed request: IN_PROGRESS record whose updatedAt is 31s old.
     // Hash must match what the middleware computes ('/' because of the mount).
-    await seedStaleRecord(key, generateRequestHash('POST', '/', body), 31_000);
+    await seedStaleRecord(key, generateRequestHash('POST', '/payments', body), 31_000);
 
     const res = await request(app).post('/payments').set('Idempotency-Key', key).send(body);
 

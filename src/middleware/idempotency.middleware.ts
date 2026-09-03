@@ -2,7 +2,7 @@
 // Pre-controller middleware that prepares the idempotency descriptor for
 // POST /payments. Attached to the route via paymentRouter.post('/', ...).
 //
-// Responsibilities (per AGENTS.md §4.2 — middleware = cross-cutting concerns):
+
 //   1. Extract the Idempotency-Key header
 //   2. Validate it's a UUID v4 (any version technically works, but the spec
 //      asks for v4 and the OpenAPI schema declares format: uuid)
@@ -11,7 +11,7 @@
 //      hash, different body → different hash → IdempotencyKeyReusedError.
 //   4. Attach { key, requestHash } to req.idempotency for the controller.
 //
-// Explicitly NOT done here (per AGENTS.md §5.5 + §5.7):
+// Explicitly NOT done here
 //   - No Redis access            (store layer's job)
 //   - No service calls          (controller's job)
 //   - No HIT / MISS / IN_PROGRESS decision (service layer's job)
@@ -30,6 +30,17 @@ import '../types/express.types';
 
 // Header name (case-insensitive per HTTP spec, but Express lowercases).
 const IDEMPOTENCY_HEADER = 'idempotency-key';
+
+// Full mount-aware path for the request, e.g. '/payments'.
+
+function scopedRequestPath(req: Request): string {
+  const full = `${req.baseUrl}${req.path}`;
+
+  // A router mounted at '/payments' handling '/' yields '/payments/'. Trim that
+  // trailing slash so the digest input reads '/payments', while leaving a bare
+  // '/' (unmounted router) untouched.
+  return full.length > 1 && full.endsWith('/') ? full.slice(0, -1) : full;
+}
 
 // Express middleware signature.
 // route mounting reads cleanly: `paymentRouter.post('/', idempotencyMiddleware, create)`.
@@ -60,7 +71,7 @@ export function idempotencyMiddleware(req: Request, _res: Response, next: NextFu
   }
 
   // --- Check 3: compute request hash for downstream service comparison ---
-  const requestHash = generateRequestHash(req.method, req.path, req.body);
+  const requestHash = generateRequestHash(req.method, scopedRequestPath(req), req.body);
 
   // --- Check 4: attach to req for the controller + service to read ---
   // The express type augmentation in src/types/express.types.ts declares
