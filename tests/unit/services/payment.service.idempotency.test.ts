@@ -21,8 +21,10 @@ import type { StoredPayment } from '../../../src/types/payment.types';
 import {
   IdempotencyRequestInProgressError,
   InvalidAmountError,
+  InvalidOrderIdError,
   OrderIdAmountMismatchError,
   OrderIdCurrencyMismatchError,
+  OrderCreationInProgressError,
 } from '../../../src/errors';
 
 // ---------------------------------------------------------------------------
@@ -33,6 +35,7 @@ vi.mock('../../../src/store/payment.store', () => ({
   savePayment: vi.fn().mockResolvedValue(undefined),
   findPaymentByChkId: vi.fn(),
   findPaymentByOrderId: vi.fn(),
+  reserveOrderId: vi.fn(),
   updatePaymentStatus: vi.fn().mockResolvedValue(undefined),
   updateGatewayPaymentId: vi.fn().mockResolvedValue(undefined),
   findChkIdByGatewayId: vi.fn(),
@@ -86,7 +89,11 @@ vi.mock('../../../src/utils/id', () => ({
 // ---------------------------------------------------------------------------
 
 import { createPaymentWithIdempotency } from '../../../src/services/payments.service';
-import { findPaymentByOrderId, savePayment } from '../../../src/store/payment.store';
+import {
+  findPaymentByOrderId,
+  reserveOrderId,
+  savePayment,
+} from '../../../src/store/payment.store';
 import {
   checkIdempotency,
   completeIdempotency,
@@ -139,6 +146,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   vi.mocked(completeIdempotency).mockResolvedValue(true);
   vi.mocked(releaseIdempotency).mockResolvedValue(true);
+  vi.mocked(reserveOrderId).mockResolvedValue(true);
 });
 
 // ---------------------------------------------------------------------------
@@ -165,6 +173,150 @@ describe('createPaymentWithIdempotency — validation ordering', () => {
     );
 
     expect(checkIdempotency).not.toHaveBeenCalled();
+  });
+
+  // orderId reaches Redis as part of chk:pay:by-order:{orderId} and is rendered
+  // into the checkout page, so it is rejected before it can do either.
+  it.each([
+    ['missing', undefined],
+    ['empty', ''],
+    ['whitespace only', '   '],
+    ['non-string', 12345],
+    ['over 64 chars', 'o'.repeat(65)],
+    ['containing a colon (key separator)', 'order:123'],
+    ['containing whitespace', 'order 123'],
+    ['containing a newline', 'order\n123'],
+    ['containing angle brackets', '<script>'],
+  ])('rejects an orderId that is %s', async (_label, orderId) => {
+    await expect(
+      createPaymentWithIdempotency({ ...REQUEST, orderId } as never, IDEMPOTENCY),
+    ).rejects.toThrow(InvalidOrderIdError);
+
+    // Never reaches Redis: no key is claimed and no reservation is attempted.
+    expect(checkIdempotency).not.toHaveBeenCalled();
+    expect(reserveOrderId).not.toHaveBeenCalled();
+  });
+
+  it.each(['order_abc123', 'ORDER-001', 'inv.2026.0001', 'o'.repeat(64)])(
+    'accepts the merchant-style orderId %s',
+    async (orderId) => {
+      vi.mocked(checkIdempotency).mockResolvedValue({ type: 'MISS' });
+      mockGatewayCreate();
+
+      await expect(
+        createPaymentWithIdempotency({ ...REQUEST, orderId }, IDEMPOTENCY),
+      ).resolves.toBeDefined();
+    },
+  );
+});
+
+// ---------------------------------------------------------------------------
+// orderId reservation — the concurrency guard
+// ---------------------------------------------------------------------------
+
+describe('createPaymentWithIdempotency — orderId reservation', () => {
+  beforeEach(() => {
+    vi.mocked(checkIdempotency).mockResolvedValue({ type: 'MISS' });
+    mockGatewayCreate();
+  });
+
+  it('reserves the orderId BEFORE calling the gateway', async () => {
+    const invocations: string[] = [];
+    vi.mocked(reserveOrderId).mockImplementation(async () => {
+      invocations.push('reserve');
+      return true;
+    });
+    vi.mocked(getActiveGateway).mockReturnValue({
+      createPayment: vi.fn().mockImplementation(() => {
+        invocations.push('gateway');
+        return Promise.resolve({
+          gatewayId: 'order_RzPFresh01',
+          gatewayOrderId: 'order_RzPFresh01',
+          status: PaymentStatus.PENDING,
+          amount: REQUEST.amount,
+          currency: 'INR',
+        });
+      }),
+    } as never);
+
+    await createPaymentWithIdempotency(REQUEST, IDEMPOTENCY);
+
+    // Reserving after the gateway call would leave the original race intact.
+    expect(invocations).toEqual(['reserve', 'gateway']);
+  });
+
+  it('reserves under the same chkId the payment is created with', async () => {
+    const result = await createPaymentWithIdempotency(REQUEST, IDEMPOTENCY);
+
+    // savePayment() commits the reservation only if the ids match; a mismatch
+    // would write a second, conflicting index entry.
+    expect(reserveOrderId).toHaveBeenCalledWith(REQUEST.orderId, result.paymentId);
+  });
+
+  it('rejects with 409 when the reservation is held and no payment exists yet', async () => {
+    vi.mocked(reserveOrderId).mockResolvedValue(false);
+    vi.mocked(findPaymentByOrderId).mockResolvedValue(null);
+
+    await expect(createPaymentWithIdempotency(REQUEST, IDEMPOTENCY)).rejects.toThrow(
+      OrderCreationInProgressError,
+    );
+  });
+
+  it('does NOT call the gateway when it loses the reservation', async () => {
+    vi.mocked(reserveOrderId).mockResolvedValue(false);
+    vi.mocked(findPaymentByOrderId).mockResolvedValue(null);
+
+    await expect(createPaymentWithIdempotency(REQUEST, IDEMPOTENCY)).rejects.toThrow(
+      OrderCreationInProgressError,
+    );
+
+    // This is the whole point: the loser must not create a second order.
+    expect(getActiveGateway).not.toHaveBeenCalled();
+    expect(savePayment).not.toHaveBeenCalled();
+  });
+
+  it('releases the idempotency claim before surfacing the 409', async () => {
+    vi.mocked(reserveOrderId).mockResolvedValue(false);
+    vi.mocked(findPaymentByOrderId).mockResolvedValue(null);
+
+    await expect(createPaymentWithIdempotency(REQUEST, IDEMPOTENCY)).rejects.toThrow(
+      OrderCreationInProgressError,
+    );
+
+    // No gateway call happened, so handing the key back is provably safe —
+    // otherwise the client's key would sit IN_PROGRESS for the stale window
+    // after a 409 it can legitimately retry.
+    expect(releaseIdempotency).toHaveBeenCalledWith({
+      key: IDEMPOTENCY.key,
+      requestHash: IDEMPOTENCY.requestHash,
+    });
+  });
+
+  it('HOLDS the reservation when the gateway call fails', async () => {
+    vi.mocked(getActiveGateway).mockReturnValue({
+      createPayment: vi.fn().mockRejectedValue(new Error('gateway exploded')),
+    } as never);
+
+    await expect(createPaymentWithIdempotency(REQUEST, IDEMPOTENCY)).rejects.toThrow(
+      'gateway exploded',
+    );
+
+    // An order may exist despite the error. Releasing the orderId would let a
+    // retry create the duplicate the reservation exists to prevent; the 30s
+    // TTL is the recovery path instead.
+    expect(releaseIdempotency).not.toHaveBeenCalled();
+  });
+
+  it('still guards the orderId when no idempotency key is supplied', async () => {
+    vi.mocked(reserveOrderId).mockResolvedValue(false);
+    vi.mocked(findPaymentByOrderId).mockResolvedValue(null);
+
+    // The reservation is independent of the idempotency layer — a client that
+    // omits the header is still protected against concurrent duplicates.
+    await expect(createPaymentWithIdempotency(REQUEST)).rejects.toThrow(
+      OrderCreationInProgressError,
+    );
+    expect(releaseIdempotency).not.toHaveBeenCalled();
   });
 });
 
@@ -201,6 +353,8 @@ describe('createPaymentWithIdempotency — idempotency check', () => {
 describe('createPaymentWithIdempotency — orderId dedup path', () => {
   beforeEach(() => {
     vi.mocked(checkIdempotency).mockResolvedValue({ type: 'MISS' });
+    // Reservation lost: the orderId key is already held by a committed payment.
+    vi.mocked(reserveOrderId).mockResolvedValue(false);
     vi.mocked(findPaymentByOrderId).mockResolvedValue(EXISTING_PAYMENT);
   });
 
@@ -290,6 +444,7 @@ describe('createPaymentWithIdempotency — orderId dedup path', () => {
 describe('createPaymentWithIdempotency — create path', () => {
   beforeEach(() => {
     vi.mocked(checkIdempotency).mockResolvedValue({ type: 'MISS' });
+    vi.mocked(reserveOrderId).mockResolvedValue(true);
     vi.mocked(findPaymentByOrderId).mockResolvedValue(null);
     mockGatewayCreate();
   });

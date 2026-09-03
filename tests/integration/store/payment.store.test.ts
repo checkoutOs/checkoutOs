@@ -16,10 +16,13 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import {
   savePayment,
   findPaymentByChkId,
+  findPaymentByOrderId,
   findChkIdByGatewayId,
   updatePaymentStatus,
   updateGatewayPaymentId,
+  reserveOrderId,
 } from '../../../src/store/payment.store';
+import { ORDER_RESERVATION_TTL_SECONDS } from '../../../src/types/common.types';
 import { redisClient } from '../../../src/store/redis.client';
 import { PaymentStatus } from '../../../src/types/payment.types';
 import type { StoredPayment } from '../../../src/types/payment.types';
@@ -323,5 +326,113 @@ describe('savePayment — pipeline atomicity', () => {
 
     expect(hashExists).toBe(1);
     expect(lookupExists).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// reserveOrderId — the concurrency primitive
+// ---------------------------------------------------------------------------
+// These run against real Redis on purpose: SET NX and the commit Lua script are
+// exactly the parts a mock cannot prove. ioredis-mock has no cjson, so the
+// guard script cannot even execute there.
+
+describe('reserveOrderId', () => {
+  it('grants the reservation to the first caller only', async () => {
+    const orderId = 'order_reserve_001';
+
+    const first = await reserveOrderId(orderId, 'chk_first0000000000000000000001');
+    const second = await reserveOrderId(orderId, 'chk_second000000000000000000002');
+
+    expect(first).toBe(true);
+    expect(second).toBe(false);
+  });
+
+  it('grants exactly one reservation under concurrent contention', async () => {
+    const orderId = 'order_reserve_race';
+
+    // The real test of atomicity: fire many claims simultaneously and require
+    // that exactly one wins. A check-then-act implementation fails this.
+    const results = await Promise.all(
+      Array.from({ length: 20 }, (_, i) => reserveOrderId(orderId, `chk_racer${String(i)}`)),
+    );
+
+    expect(results.filter(Boolean)).toHaveLength(1);
+  });
+
+  it('keeps the winner value intact when losers contend', async () => {
+    const orderId = 'order_reserve_value';
+    const winner = 'chk_winner00000000000000000001';
+
+    await reserveOrderId(orderId, winner);
+    await reserveOrderId(orderId, 'chk_loser000000000000000000001');
+
+    expect(await redisClient.get(`chk:pay:by-order:${orderId}`)).toBe(winner);
+  });
+
+  it('sets a TTL so a crashed request cannot block the orderId forever', async () => {
+    const orderId = 'order_reserve_ttl';
+    await reserveOrderId(orderId, 'chk_ttl00000000000000000000001');
+
+    const ttl = await redisClient.ttl(`chk:pay:by-order:${orderId}`);
+
+    expect(ttl).toBeGreaterThan(0);
+    expect(ttl).toBeLessThanOrEqual(ORDER_RESERVATION_TTL_SECONDS);
+  });
+
+  it('resolves an uncommitted reservation to null, not a phantom payment', async () => {
+    const orderId = 'order_reserve_dangling';
+    await reserveOrderId(orderId, 'chk_dangling0000000000000000001');
+
+    // The reservation points at a chkId whose hash does not exist yet. The
+    // two-step lookup in findPaymentByOrderId must treat that as "no payment"
+    // — this is what lets the reservation double as the index with no sentinel.
+    expect(await findPaymentByOrderId(orderId)).toBeNull();
+  });
+});
+
+describe('savePayment — committing a reservation', () => {
+  it('clears the TTL so the index becomes permanent', async () => {
+    const payment = makeStoredPayment({
+      chkId: 'chk_commit00000000000000000001',
+      orderId: 'order_commit_001',
+    });
+
+    await reserveOrderId(payment.orderId, payment.chkId);
+    await savePayment(payment);
+
+    // -1 means "key exists with no expiry".
+    expect(await redisClient.ttl(`chk:pay:by-order:${payment.orderId}`)).toBe(-1);
+    expect(await redisClient.get(`chk:pay:by-order:${payment.orderId}`)).toBe(payment.chkId);
+  });
+
+  it('does not steal an index entry owned by another chkId', async () => {
+    const orderId = 'order_commit_contested';
+    const owner = 'chk_owner00000000000000000001';
+
+    // Simulates: our reservation expired mid-flight and another request claimed
+    // the orderId. Overwriting here would orphan their payment.
+    await reserveOrderId(orderId, owner);
+
+    const latecomer = makeStoredPayment({
+      chkId: 'chk_latecomer000000000000000001',
+      orderId,
+    });
+    await savePayment(latecomer);
+
+    expect(await redisClient.get(`chk:pay:by-order:${orderId}`)).toBe(owner);
+    // The losing payment is still fully readable by its own id — it is only
+    // unreachable via the orderId index.
+    expect(await findPaymentByChkId(latecomer.chkId)).not.toBeNull();
+  });
+
+  it('writes the index when no reservation was taken (direct createPayment)', async () => {
+    const payment = makeStoredPayment({
+      chkId: 'chk_noreserve0000000000000001',
+      orderId: 'order_no_reservation',
+    });
+
+    await savePayment(payment);
+
+    expect(await redisClient.get(`chk:pay:by-order:${payment.orderId}`)).toBe(payment.chkId);
   });
 });

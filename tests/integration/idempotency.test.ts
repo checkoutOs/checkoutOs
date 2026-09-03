@@ -216,3 +216,113 @@ describe('POST /payments — idempotency', () => {
     expect(stored.status).toBe('COMPLETED');
   });
 });
+
+// ---------------------------------------------------------------------------
+// BUG-012 — concurrent creates on the same orderId
+// ---------------------------------------------------------------------------
+// The idempotency key cannot help here: different keys are different SET NX
+// targets, so every request legitimately wins its own claim. Only the orderId
+// reservation prevents two gateway orders for one merchant order.
+
+describe('POST /payments — concurrent same-orderId creation', () => {
+  beforeEach(async () => {
+    const keys = await redisClient.keys('chk:*');
+    if (keys.length > 0) {
+      await redisClient.del(...keys);
+    }
+  });
+
+  it('lets only ONE of five parallel same-orderId requests create a payment', async () => {
+    const orderId = `order_race_${String(Date.now())}`;
+    const body = validBody(orderId);
+
+    // Five DIFFERENT idempotency keys — the scenario the idempotency layer
+    // cannot catch. Before the reservation this produced five gateway orders.
+    const responses = await Promise.all(
+      Array.from({ length: 5 }, () =>
+        request(app).post('/payments').set('Idempotency-Key', freshKey()).send(body),
+      ),
+    );
+
+    const created = responses.filter((r) => r.status === 201);
+    const rejected = responses.filter((r) => r.status === 409);
+
+    expect(created).toHaveLength(1);
+    expect(rejected).toHaveLength(4);
+    for (const r of rejected) {
+      expect(r.body.error.code).toBe('ORDER_CREATION_IN_PROGRESS');
+    }
+  });
+
+  it('leaves exactly one payment record behind after the race', async () => {
+    const orderId = `order_race_single_${String(Date.now())}`;
+    const body = validBody(orderId);
+
+    await Promise.all(
+      Array.from({ length: 5 }, () =>
+        request(app).post('/payments').set('Idempotency-Key', freshKey()).send(body),
+      ),
+    );
+
+    // One payment hash, and the index resolves to it. Two hashes here would
+    // mean two gateway orders were created.
+    const paymentKeys = await redisClient.keys('chk:pay:chk_*');
+    expect(paymentKeys).toHaveLength(1);
+
+    const indexed = await redisClient.get(`chk:pay:by-order:${orderId}`);
+    expect(paymentKeys[0]).toBe(`chk:pay:${String(indexed)}`);
+  });
+
+  it('serves the committed payment to a later request instead of 409', async () => {
+    const orderId = `order_race_then_dedup_${String(Date.now())}`;
+    const body = validBody(orderId);
+
+    const first = await request(app)
+      .post('/payments')
+      .set('Idempotency-Key', freshKey())
+      .send(body);
+    expect(first.status).toBe(201);
+
+    // Reservation is committed now, so the loser path finds a real payment and
+    // dedups rather than returning ORDER_CREATION_IN_PROGRESS.
+    const second = await request(app)
+      .post('/payments')
+      .set('Idempotency-Key', freshKey())
+      .send(body);
+
+    expect(second.status).toBe(201);
+    expect(second.body.data.paymentId).toBe(first.body.data.paymentId);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// BUG-003 — orderId validation
+// ---------------------------------------------------------------------------
+
+describe('POST /payments — orderId validation', () => {
+  it.each([
+    ['missing', undefined],
+    ['empty', ''],
+    ['colon (Redis key separator)', 'order:123'],
+    ['over 64 chars', 'o'.repeat(65)],
+  ])('rejects an orderId that is %s with 400', async (_label, orderId) => {
+    const res = await request(app)
+      .post('/payments')
+      .set('Idempotency-Key', freshKey())
+      .send({ amount: 50000, currency: 'INR', orderId });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error.code).toBe('INVALID_ORDER_ID');
+  });
+
+  it('never creates a chk:pay:by-order:undefined key', async () => {
+    await request(app)
+      .post('/payments')
+      .set('Idempotency-Key', freshKey())
+      .send({ amount: 50000, currency: 'INR' });
+
+    // The BUG-003 failure mode: every malformed request collapsing onto one
+    // shared key, so one caller could be handed another caller's payment.
+    expect(await redisClient.exists('chk:pay:by-order:undefined')).toBe(0);
+  });
+});

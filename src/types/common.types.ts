@@ -80,6 +80,27 @@ export const IDEMPOTENCY_TTL_SECONDS = 86400; // 24 hours
 export const IDEMPOTENCY_STALE_TIMEOUT_MS = 30000; // 30 seconds
 export const IDEMPOTENCY_MAX_RETRIES = 3;
 
+// ---------------------------------------------------------------------------
+// OrderId reservation
+// ---------------------------------------------------------------------------
+// How long a pre-gateway reservation on chk:pay:by-order:{orderId} survives
+// before Redis expires it. Must exceed the gateway HTTP timeout (10s) so a
+// slow-but-successful create cannot have its own reservation expire underneath
+// it. Deliberately the same 30s as IDEMPOTENCY_STALE_TIMEOUT_MS — one recovery
+// window to reason about, not two.
+//
+// The TTL is the crash-recovery bound: a process that dies between reserving
+// and saving blocks that orderId for at most this long.
+export const ORDER_RESERVATION_TTL_SECONDS = 30;
+
+// orderId is a merchant-supplied identifier that becomes part of a Redis key
+// (chk:pay:by-order:{orderId}) and is rendered into the checkout page, so it is
+// constrained on both length and charset. Deliberately NOT a UUID: merchants
+// bring their own order references (invoice numbers, sequential ids), and the
+// published API examples use forms like `order_abc123`.
+export const ORDER_ID_MAX_LENGTH = 64;
+export const ORDER_ID_PATTERN = /^[A-Za-z0-9_.-]+$/;
+
 export type IdempotencyStatus = 'IN_PROGRESS' | 'COMPLETED';
 
 export interface IdempotencyRecord {
@@ -158,6 +179,8 @@ export const ErrorCode = {
   INVALID_IDEMPOTENCY_KEY: 'INVALID_IDEMPOTENCY_KEY',
   ORDER_ID_AMOUNT_MISMATCH: 'ORDER_ID_AMOUNT_MISMATCH',
   ORDER_ID_CURRENCY_MISMATCH: 'ORDER_ID_CURRENCY_MISMATCH',
+  INVALID_ORDER_ID: 'INVALID_ORDER_ID',
+  ORDER_CREATION_IN_PROGRESS: 'ORDER_CREATION_IN_PROGRESS',
 } as const;
 
 export type ErrorCodeValue = (typeof ErrorCode)[keyof typeof ErrorCode];

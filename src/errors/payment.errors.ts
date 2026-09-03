@@ -95,6 +95,34 @@ export class InvalidAmountError extends AppError {
   }
 }
 
+// Invalid orderId
+// Throw when orderId is missing, empty, over-long, or contains characters that
+// are unsafe to embed in a Redis key or render into the checkout page.
+export class InvalidOrderIdError extends AppError {
+  readonly httpStatus = 400;
+
+  constructor(orderId: unknown, reason: string) {
+    super(ErrorCode.INVALID_ORDER_ID, `Invalid orderId: ${reason}`, { received: orderId, reason });
+  }
+}
+
+// OrderId creation already in flight
+// Throw when another request holds the pre-gateway reservation for this
+// orderId and no payment exists yet. The client should retry: whichever
+// request holds the reservation is mid-create, and a retry will either see the
+// finished payment (dedup) or find the reservation expired.
+export class OrderCreationInProgressError extends AppError {
+  readonly httpStatus = 409;
+
+  constructor(orderId: string) {
+    super(
+      ErrorCode.ORDER_CREATION_IN_PROGRESS,
+      `A payment for orderId ${orderId} is already being created. Retry shortly.`,
+      { orderId },
+    );
+  }
+}
+
 // Refund not allowed
 // when a refund is attempted on a pyament that isn't in SUCCESS status
 

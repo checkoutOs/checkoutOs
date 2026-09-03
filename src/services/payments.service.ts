@@ -21,10 +21,12 @@ import { config } from '../config';
 import {
   PaymentNotFoundError,
   InvalidAmountError,
+  InvalidOrderIdError,
   RefundNotAllowedError,
   RefundAmountExceedsPaymentError,
   OrderIdAmountMismatchError,
   OrderIdCurrencyMismatchError,
+  OrderCreationInProgressError,
 } from '../errors';
 import { PaymentStatus } from '../types/payment.types';
 import type {
@@ -36,9 +38,10 @@ import type {
 } from '../types/payment.types';
 
 import type { CreatePaymentParams } from '../types/gateway.types';
+import { ORDER_ID_MAX_LENGTH, ORDER_ID_PATTERN } from '../types/common.types';
 
 import { checkIdempotency, completeIdempotency, releaseIdempotency } from './idempotency.service';
-import { findPaymentByOrderId } from '../store/payment.store';
+import { findPaymentByOrderId, reserveOrderId } from '../store/payment.store';
 import { IdempotencyRequestInProgressError } from '../errors';
 
 const log = createContextLogger('payment-service');
@@ -65,24 +68,61 @@ const TERMINAL_STATUSES = new Set<PaymentStatus>([
 // it up front for exactly that reason; createPayment() calls it too so direct
 // callers keep the same contract. Running twice is harmless.
 //
-// Note: orderId and currency are not validated here yet (BUG-003) — this is
-// where that check belongs when it lands.
+// orderId is validated here because it becomes part of a Redis key
+// (chk:pay:by-order:{orderId}) and is rendered into the checkout page. An
+// unvalidated orderId is not merely untidy: `undefined` collapses every
+// malformed request onto the single key chk:pay:by-order:undefined, so one
+// caller can be handed another caller's payment.
+//
+// Not a UUID by design — orderId is the merchant's own reference (invoice
+// numbers, sequential ids), and the published API examples use forms like
+// `order_abc123`. Requiring UUIDs would force merchants to keep a translation
+// table, and would not help concurrency anyway: duplicate orderIds are the
+// intended signal for deduplication, so safety comes from atomic reservation
+// (reserveOrderId) rather than from forbidding repeats.
 
 function validateCreatePaymentRequest(req: CreatePaymentRequest): void {
   if (typeof req.amount !== 'number' || !Number.isInteger(req.amount) || req.amount <= 0) {
     throw new InvalidAmountError(req.amount);
   }
+
+  if (typeof req.orderId !== 'string' || req.orderId.trim() === '') {
+    throw new InvalidOrderIdError(
+      req.orderId,
+      'orderId is required and must be a non-empty string',
+    );
+  }
+
+  if (req.orderId.length > ORDER_ID_MAX_LENGTH) {
+    throw new InvalidOrderIdError(
+      req.orderId,
+      `orderId must be at most ${ORDER_ID_MAX_LENGTH} characters`,
+    );
+  }
+
+  if (!ORDER_ID_PATTERN.test(req.orderId)) {
+    throw new InvalidOrderIdError(
+      req.orderId,
+      'orderId may contain only letters, digits, underscore, hyphen and dot',
+    );
+  }
 }
 
 /*
-1) Validate amount
+1) Validate amount + orderId
 2) call gateway.createPayment();
-3) Generate chk_ID
+3) Use the caller's chk_ID (or generate one)
 4) save StorePayment to Redis gatewayPaymentId empty
 5) Return PaymentResponse
 */
 
-export async function createPayment(req: CreatePaymentRequest): Promise<PaymentResponse> {
+// chkId is accepted so createPaymentWithIdempotency() can reserve the orderId
+// under the same id BEFORE the gateway call. Direct callers may omit it and
+// get a freshly generated one, preserving the original contract.
+export async function createPayment(
+  req: CreatePaymentRequest,
+  reservedChkId?: string,
+): Promise<PaymentResponse> {
   validateCreatePaymentRequest(req);
 
   const plugin = getActiveGateway();
@@ -107,8 +147,8 @@ export async function createPayment(req: CreatePaymentRequest): Promise<PaymentR
 
   const gatewayResult = await plugin.createPayment(params);
 
-  //   generate chk_ID
-  const chkId = generatePaymentId();
+  //   use the reserved chk_ID, or generate one for direct callers
+  const chkId = reservedChkId ?? generatePaymentId();
   const timestamp = now();
 
   /* gatewayPaymentId is empty at creaton time
@@ -254,9 +294,22 @@ export async function createPaymentWithIdempotency(
   }
 
   // -----------------------------------------------------------------------
-  // Step 2: OrderId dedup (catches duplicates even without idempotency key)
+  // Step 2: Reserve the orderId (catches duplicates even without an idem key)
   // -----------------------------------------------------------------------
-  const existingByOrderId = await findPaymentByOrderId(req.orderId);
+  // SET NX on chk:pay:by-order:{orderId}, taken BEFORE the gateway call.
+  //
+  // The previous read-then-act — findPaymentByOrderId() here, savePayment()
+  // after the gateway returned — left a window as wide as a full gateway
+  // round-trip (up to the 10s HTTP timeout). Two concurrent requests carrying
+  // the same orderId both read "no payment", both created a gateway order, and
+  // the second save overwrote the first's index: two live orders for one
+  // merchant order, one of them unreachable by orderId.
+  //
+  // The reservation holds this request's chkId, so if we crash before saving,
+  // findPaymentByOrderId() resolves it to null via its two-step lookup (the
+  // payment hash does not exist) and the TTL clears it within 30s.
+  const chkId = generatePaymentId();
+  const reserved = await reserveOrderId(req.orderId, chkId);
 
   // Both branches below assign `response` and fall through to Step 4 — they
   // never return early. Returning directly from the dedup branch would skip
@@ -266,7 +319,19 @@ export async function createPaymentWithIdempotency(
   // and dedups again — so the key could never become a HIT.
   let response: PaymentResponse;
 
-  if (existingByOrderId) {
+  if (!reserved) {
+    // Someone else owns this orderId — either a committed payment (the normal
+    // dedup case) or a reservation still in flight.
+    const existingByOrderId = await findPaymentByOrderId(req.orderId);
+
+    if (existingByOrderId === null) {
+      // Reservation held but no payment yet: a concurrent request is mid-create.
+      // Nothing was created at the gateway on this path, so the idempotency
+      // claim is provably safe to hand back before surfacing the 409.
+      log.warn('orderId.creation_in_progress', { orderId: req.orderId });
+      await releaseClaim(idempotency, 'orderId.creation_in_progress');
+      throw new OrderCreationInProgressError(req.orderId);
+    }
     // Validate amount matches
     if (existingByOrderId.amount !== req.amount) {
       log.error('orderId.amount_mismatch', {
@@ -313,7 +378,16 @@ export async function createPaymentWithIdempotency(
     // inside createPayment(). Keeping it as a separate function preserves the
     // single source of truth for the create flow — tests that exercise
     // createPayment() directly continue to work without modification.
-    response = await createPayment(req);
+    //
+    // chkId is the one already reserved above, so savePayment() commits that
+    // reservation rather than writing a second, conflicting index entry.
+    //
+    // A failure here deliberately leaves BOTH the idempotency claim and the
+    // orderId reservation in place: plugin.createPayment() has been invoked, so
+    // an order may exist even if the call reported an error. Releasing either
+    // one would let a retry create the duplicate this reservation exists to
+    // prevent. Both expire on their own within 30s.
+    response = await createPayment(req, chkId);
   }
 
   // -----------------------------------------------------------------------

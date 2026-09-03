@@ -24,6 +24,7 @@ import { StoreError } from '../errors/store.errors';
 import { now } from '../utils/time';
 import type { StoredPayment } from '../types/payment.types';
 import { PaymentStatus } from '../types/payment.types';
+import { ORDER_RESERVATION_TTL_SECONDS } from '../types/common.types';
 
 // ---------------------------------------------------------------------------
 // Key builders
@@ -41,6 +42,24 @@ const Keys = {
   // maps a merchant supplied orderId to the internal chk_ ID
   orderLookup: (orderId: string): string => `chk:pay:by-order:${orderId}`,
 };
+
+// Lua: commit the orderId index. Writes only when the key is absent or already
+// holds this caller's chkId; returns 0 when another request owns it.
+//
+// SET without an expiry clears any TTL, which is how a reservation taken by
+// reserveOrderId() is promoted from temporary claim to permanent index.
+const COMMIT_ORDER_LOOKUP_SCRIPT = `
+local key = KEYS[1]
+local chkId = ARGV[1]
+
+local current = redis.call("GET", key)
+if current and current ~= chkId then
+    return 0
+end
+
+redis.call("SET", key, chkId)
+return 1
+`;
 
 // ---------------------------------------------------------------------------
 // Serialisation helpers
@@ -122,15 +141,67 @@ export async function savePayment(payment: StoredPayment): Promise<void> {
     // Allows status polling via order_XXXX before webhook arrives.
     pipeline.set(Keys.gatewayLookup(payment.gateway, payment.gatewayOrderId), payment.chkId);
 
-    // Reverse lookup for orderId → chk_id.
-    // Enable orderId deduplication
-
-    pipeline.set(Keys.orderLookup(payment.orderId), payment.chkId);
-
     await pipeline.exec();
+
+    // Reverse lookup for orderId → chk_id — commits the reservation taken by
+    // reserveOrderId() before the gateway call, dropping its TTL so the index
+    // becomes permanent.
+    //
+    // Guarded rather than a plain SET: if this process was slow enough that its
+    // reservation expired and another request claimed the orderId, overwriting
+    // would silently steal their index entry and orphan their payment. In that
+    // case we leave their key alone — this payment stays reachable by chkId and
+    // via the gateway-id lookup, which is the safe way to lose the race.
+    await commitOrderLookup(payment.orderId, payment.chkId);
   } catch (err) {
     throw new StoreError(`savePayment:${payment.chkId}`, err);
   }
+}
+
+// ---------------------------------------------------------------------------
+// reserveOrderId
+// ---------------------------------------------------------------------------
+// Atomically claim an orderId before calling the gateway.
+//
+// This is what makes orderId deduplication concurrency-safe. Without it,
+// findPaymentByOrderId() and savePayment() form a check-then-act pair with a
+// full gateway round-trip in between: two concurrent requests carrying the same
+// orderId both read "no payment", both create a gateway order, and the second
+// save clobbers the first's index — two live orders for one merchant order.
+//
+// Returns true if the caller now owns the orderId, false if someone else does
+// (either an in-flight reservation or a committed payment).
+//
+// The reservation holds the caller's chkId, so a reservation that is never
+// committed resolves to null through findPaymentByOrderId()'s two-step lookup
+// (the payment hash does not exist yet). No sentinel value is needed and no
+// reader has to know reservations exist.
+
+export async function reserveOrderId(orderId: string, chkId: string): Promise<boolean> {
+  try {
+    const result = await redisClient.set(
+      Keys.orderLookup(orderId),
+      chkId,
+      'EX',
+      ORDER_RESERVATION_TTL_SECONDS,
+      'NX',
+    );
+    return result === 'OK';
+  } catch (err) {
+    throw new StoreError(`reserveOrderId:${orderId}`, err);
+  }
+}
+
+// Commit the orderId index: write it permanently (no TTL), but only if the key
+// is absent or still holds our own chkId. Returns true when written.
+async function commitOrderLookup(orderId: string, chkId: string): Promise<boolean> {
+  const result = await redisClient.eval(
+    COMMIT_ORDER_LOOKUP_SCRIPT,
+    1,
+    Keys.orderLookup(orderId),
+    chkId,
+  );
+  return result === 1;
 }
 
 // ---------------------------------------------------------------------------
