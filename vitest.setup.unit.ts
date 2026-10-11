@@ -40,6 +40,8 @@ vi.mock('./src/utils/logger', () => ({
     error: vi.fn(),
     debug: vi.fn(),
   },
+  // Mirrors the real module surface — server.ts calls this at startup.
+  configureLogger: vi.fn(),
   createContextLogger: () => ({
     info: vi.fn(),
     warn: vi.fn(),

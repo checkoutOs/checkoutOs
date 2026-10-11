@@ -19,7 +19,7 @@ import './bootstrap';
 import { buildApp, initialise } from './app';
 import { disconnectRedis } from './store/redis.client';
 import { config } from './config';
-import { createContextLogger } from './utils/logger';
+import { configureLogger, createContextLogger } from './utils/logger';
 
 console.log('ENV DEBUG:', {
   ACTIVE_GATEWAY: process.env.ACTIVE_GATEWAY,
@@ -29,6 +29,13 @@ console.log('ENV DEBUG:', {
 const log = createContextLogger('server');
 
 async function start(): Promise<void> {
+  // --- Hand validated config to the logger ---
+  // utils/logger.ts cannot import config without recreating the startup import
+  // cycle (see the note at the top of that file), so the composition root
+  // pushes the settings down. Runs before anything else in start() so all
+  // startup logging uses the configured level and format.
+  configureLogger({ isTest: config.isTest, isDevelopment: config.isDevelopment });
+
   // --- Initialise dependencies before accepting traffic ---
   await initialise();
 

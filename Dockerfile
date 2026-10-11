@@ -15,7 +15,20 @@ WORKDIR /app
 COPY package*.json ./
 
 # Install ALL dependencies including devDependencies — needed for tsc
-RUN npm ci
+#
+# `npm pkg delete scripts.prepare` drops the husky hook installer before
+# installing. npm runs `prepare` automatically after `npm ci`, but husky exists
+# to install git hooks for developers — there is no .git directory in a build
+# context, and an image never commits.
+#
+# Scoped this way on purpose. Making the script itself tolerant
+# (`"prepare": "husky || true"`) would swallow REAL husky failures everywhere,
+# including a developer whose hooks silently fail to install. `--ignore-scripts`
+# would be too broad the other way: protobufjs reaches the production tree via
+# @opentelemetry/sdk-node → @grpc/grpc-js → @grpc/proto-loader and defines a
+# genuine postinstall. Deleting one script leaves both of those intact.
+RUN npm pkg delete scripts.prepare && \
+    npm ci
 
 # Copy source
 COPY tsconfig.json ./
@@ -45,8 +58,12 @@ WORKDIR /app
 # Copy package files for production install
 COPY package*.json ./
 
-# Install production dependencies only — devDependencies excluded
-RUN npm ci --omit=dev && \
+# Install production dependencies only — devDependencies excluded.
+# husky is a devDependency, so without dropping `prepare` first this stage
+# fails with `sh: husky: not found` (exit 127). See the builder stage for why
+# the fix lives here rather than in package.json.
+RUN npm pkg delete scripts.prepare && \
+    npm ci --omit=dev && \
     # Clean npm cache to reduce image size
     npm cache clean --force
 
