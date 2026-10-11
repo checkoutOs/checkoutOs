@@ -34,7 +34,13 @@ async function start(): Promise<void> {
   // cycle (see the note at the top of that file), so the composition root
   // pushes the settings down. Runs before anything else in start() so all
   // startup logging uses the configured level and format.
-  configureLogger({ isTest: config.isTest, isDevelopment: config.isDevelopment });
+  configureLogger({
+    isTest: config.isTest,
+    isDevelopment: config.isDevelopment,
+    env: config.env,
+    version: config.app.version,
+    ...(config.log.format !== undefined && { format: config.log.format }),
+  });
 
   // --- Initialise dependencies before accepting traffic ---
   await initialise();

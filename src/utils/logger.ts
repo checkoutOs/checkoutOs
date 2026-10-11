@@ -27,10 +27,28 @@ import winston from 'winston';
 
 // Settings the logger needs, supplied by the caller rather than imported.
 // Mirrors the shape of `config` without depending on it.
+//
+// env / version / format are optional so a caller that knows only the two
+// flags still gets a working logger. Every call re-applies all settings, so an
+// omitted field resets to its default rather than keeping a previous value.
 export interface LoggerSettings {
   isTest: boolean;
   isDevelopment: boolean;
+  // Stamped on every record so Loki labels derive from the log itself
+  // (ADR 003 §5 Phase 1a).
+  env?: string;
+  version?: string;
+  // Explicit output format. Omitted → pretty in development, JSON otherwise.
+  format?: 'json' | 'pretty';
 }
+
+// Service name on every record. A constant rather than a setting: it names
+// this codebase, not a deployment.
+const SERVICE_NAME = 'checkoutos';
+
+// Base fields added to every record via defaultMeta. The pretty format strips
+// them so development output stays readable.
+const BASE_FIELDS: ReadonlySet<string> = new Set(['service', 'env', 'version']);
 
 type ContextLogger = {
   info: (message: string, meta?: Record<string, unknown>) => void;
@@ -44,7 +62,10 @@ const devFormat = winston.format.combine(
   winston.format.colorize({ level: true }),
   winston.format.printf(
     ({ timestamp, level, message, ...meta }: winston.Logform.TransformableInfo): string => {
-      const metaStr = Object.keys(meta).length > 0 ? '  ' + JSON.stringify(meta, null, 0) : '';
+      const fields = Object.fromEntries(
+        Object.entries(meta).filter(([key]): boolean => !BASE_FIELDS.has(key)),
+      );
+      const metaStr = Object.keys(fields).length > 0 ? '  ' + JSON.stringify(fields, null, 0) : '';
       return `${timestamp} [${level}] ${message}${metaStr}`;
     },
   ),
@@ -71,9 +92,24 @@ function resolveLevel(settings: LoggerSettings): string {
 // development formatting.
 const DEFAULT_SETTINGS: LoggerSettings = { isTest: false, isDevelopment: false };
 
+function resolveFormat(settings: LoggerSettings): winston.Logform.Format {
+  const format = settings.format ?? (settings.isDevelopment ? 'pretty' : 'json');
+  return format === 'pretty' ? devFormat : prodFormat;
+}
+
+function resolveDefaultMeta(settings: LoggerSettings): Record<string, string> {
+  return {
+    service: SERVICE_NAME,
+    ...(settings.env !== undefined && { env: settings.env }),
+    ...(settings.version !== undefined && { version: settings.version }),
+  };
+}
+
 export const logger = winston.createLogger({
   // Individual tests can enable logging by adjusting the level.
   level: resolveLevel(DEFAULT_SETTINGS),
+
+  defaultMeta: resolveDefaultMeta(DEFAULT_SETTINGS),
 
   format: prodFormat,
 
@@ -97,7 +133,8 @@ export const logger = winston.createLogger({
 // transport silencing rather than merging.
 export function configureLogger(settings: LoggerSettings): void {
   logger.level = resolveLevel(settings);
-  logger.format = settings.isDevelopment ? devFormat : prodFormat;
+  logger.format = resolveFormat(settings);
+  logger.defaultMeta = resolveDefaultMeta(settings);
 
   for (const transport of logger.transports) {
     transport.silent = settings.isTest;

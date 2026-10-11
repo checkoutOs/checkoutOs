@@ -33,8 +33,28 @@ function loggerCode(): string {
 
 type LoggerModule = {
   logger: winston.Logger;
-  configureLogger: (settings: { isTest: boolean; isDevelopment: boolean }) => void;
+  configureLogger: (settings: {
+    isTest: boolean;
+    isDevelopment: boolean;
+    env?: string;
+    version?: string;
+    format?: 'json' | 'pretty';
+  }) => void;
 };
+
+// Run one record through the logger's current format and return the rendered
+// line — what the Console transport would write.
+function render(m: LoggerModule, fields: Record<string, unknown> = {}): string {
+  const info = {
+    level: 'info',
+    message: 'probe',
+    [Symbol.for('level')]: 'info',
+    ...(m.logger.defaultMeta as Record<string, unknown>),
+    ...fields,
+  };
+  const out = m.logger.format.transform(info, {}) as Record<symbol, unknown>;
+  return String(out[Symbol.for('message')]);
+}
 
 async function loadRealLogger(): Promise<LoggerModule> {
   return (await vi.importActual('../../../src/utils/logger')) as LoggerModule;
@@ -110,6 +130,57 @@ describe('configureLogger', () => {
     for (const transport of mod.logger.transports) {
       expect(transport.silent).toBe(false);
     }
+  });
+
+  it('stamps service, env and version on every record', () => {
+    mod.configureLogger({
+      isTest: false,
+      isDevelopment: false,
+      env: 'production',
+      version: '1.2.3',
+    });
+
+    const record = JSON.parse(render(mod));
+    expect(record).toMatchObject({ service: 'checkoutos', env: 'production', version: '1.2.3' });
+  });
+
+  it('resets env and version when a later call omits them', () => {
+    mod.configureLogger({
+      isTest: false,
+      isDevelopment: false,
+      env: 'production',
+      version: '1.2.3',
+    });
+    mod.configureLogger({ isTest: false, isDevelopment: false });
+
+    expect(mod.logger.defaultMeta).toEqual({ service: 'checkoutos' });
+  });
+
+  it('honours an explicit json format in development', () => {
+    // Lets dashboards be built locally — Loki cannot parse the pretty format.
+    mod.configureLogger({ isTest: false, isDevelopment: true, format: 'json' });
+
+    expect(() => JSON.parse(render(mod))).not.toThrow();
+  });
+
+  it('honours an explicit pretty format in production', () => {
+    mod.configureLogger({ isTest: false, isDevelopment: false, format: 'pretty' });
+
+    expect(() => JSON.parse(render(mod))).toThrow();
+  });
+
+  it('defaults to pretty in development and strips the base fields from it', () => {
+    mod.configureLogger({
+      isTest: false,
+      isDevelopment: true,
+      env: 'development',
+      version: '1.2.3',
+    });
+
+    const line = render(mod, { chkId: 'chk_probe' });
+    expect(line).toContain('chk_probe');
+    expect(line).not.toContain('checkoutos');
+    expect(line).not.toContain('1.2.3');
   });
 
   it('keeps createContextLogger usable without any configuration', () => {
