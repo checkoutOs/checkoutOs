@@ -28,6 +28,7 @@ export interface Runtime {
   version: string;
   metricsPort: number;
   metricsAuthToken: string | undefined;
+  otlpMetricsEnabled: boolean;
 }
 
 const DEFAULT_METRICS_PORT = 9464;
@@ -44,6 +45,11 @@ export function loadRuntime(source: Record<string, string | undefined> = process
   // Empty string means "unset" — never require a blank bearer token.
   const token = source['METRICS_AUTH_TOKEN'];
 
+  const otlpMetricsEnabled = [
+    source['OTEL_EXPORTER_OTLP_ENDPOINT'],
+    source['OTEL_EXPORTER_OTLP_METRICS_ENDPOINT'],
+  ].some((value): boolean => value !== undefined && value.trim() !== '');
+
   return {
     env,
     isTest: env === 'test',
@@ -52,5 +58,6 @@ export function loadRuntime(source: Record<string, string | undefined> = process
     version: source['APP_VERSION'] || '0.0.0',
     metricsPort,
     metricsAuthToken: token !== undefined && token !== '' ? token : undefined,
+    otlpMetricsEnabled,
   };
 }

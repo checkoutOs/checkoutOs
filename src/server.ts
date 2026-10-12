@@ -8,12 +8,15 @@
 //   4. Handle SIGTERM and SIGINT — graceful shutdown
 //
 // Graceful shutdown sequence:
-//   1. server.close()     — stop accepting new connections; finish in-flight requests
-//   2. disconnectRedis()  — close Redis connection cleanly
-//   3. process.exit(0)    — clean exit
+//   1. server.close()       — stop accepting new connections; finish in-flight requests
+//   2. disconnectRedis()    — close Redis connection cleanly
+//   3. shutdownTelemetry()  — close the :9464 listener, flush the OTel SDK
+//   4. process.exit(0)      — clean exit
 //
 // Keeping startup errors fatal (process.exit(1)) ensures the container
 // orchestrator (Docker, Kubernetes) detects the failure and restarts the pod.
+//
+
 import './bootstrap';
 
 import { buildApp, initialise } from './app';
@@ -41,6 +44,11 @@ async function start(): Promise<void> {
     version: config.app.version,
     ...(config.log.format !== undefined && { format: config.log.format }),
   });
+
+  // --- Refuse to boot with dead telemetry (ADR 003 §3.4) ---
+  // Scrapes our own /metrics and requires the build.info sentinel. No-op under
+  // NODE_ENV=test, where the SDK is never started.
+  await verifyTelemetry();
 
   // --- Initialise dependencies before accepting traffic ---
   await initialise();
@@ -76,7 +84,11 @@ async function start(): Promise<void> {
         log.warn('Redis disconnect error — forcing exit');
       }
 
-      // Step 3: exit cleanly
+      // Step 3: stop telemetry — never throws
+      await shutdownTelemetry();
+      log.info('Telemetry shut down');
+
+      // Step 4: exit cleanly
       process.exit(0);
     });
 

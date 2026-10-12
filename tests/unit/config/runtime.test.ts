@@ -70,6 +70,7 @@ describe('loadRuntime', () => {
       version: '0.0.0',
       metricsPort: 9464,
       metricsAuthToken: undefined,
+      otlpMetricsEnabled: false,
     });
   });
 
@@ -105,6 +106,18 @@ describe('loadRuntime', () => {
   it('treats an empty METRICS_AUTH_TOKEN as unset', () => {
     // A blank bearer token must never become the required credential.
     expect(loadRuntime({ METRICS_AUTH_TOKEN: '' }).metricsAuthToken).toBeUndefined();
+  });
+
+  it.each(['OTEL_EXPORTER_OTLP_ENDPOINT', 'OTEL_EXPORTER_OTLP_METRICS_ENDPOINT'])(
+    'enables the OTLP metrics reader when %s is set',
+    (key) => {
+      expect(loadRuntime({ [key]: 'http://collector:4318' }).otlpMetricsEnabled).toBe(true);
+    },
+  );
+
+  it('keeps OTLP push off for a blank endpoint', () => {
+    // Nothing leaves the box by default (ADR 003 §2.3).
+    expect(loadRuntime({ OTEL_EXPORTER_OTLP_ENDPOINT: '  ' }).otlpMetricsEnabled).toBe(false);
   });
 
   it('treats an empty APP_VERSION as unset', () => {
