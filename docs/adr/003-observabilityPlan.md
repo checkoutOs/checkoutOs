@@ -3,6 +3,7 @@
 **Status:** Proposed
 **Date:** 2026-09-01
 **Revised:** 2026-09-15 — verified and corrected against the tree at `a7f18a3` across two review rounds; see §14. **Phase 0 is now blocked on a prerequisite — see §5 Phase 0 Prerequisites.**
+**Implementation:** 2026-10-12 — Phase 0-pre and Phase 0 implemented; probe results recorded in §5 Phase 0 "Probe results". Status remains *Proposed* pending team acceptance.
 **Owners:** checkoutOs core team
 **Scope:** OpenTelemetry instrumentation, Prometheus-format pull metrics, Grafana Loki logs, optional Tempo traces
 
@@ -703,6 +704,47 @@ rather than load-bearing.
 | **`deployment.environment.name`** | Use the **string literal**, as in the bootstrap above. The typed constant lives in `@opentelemetry/semantic-conventions/incubating`, and incubating export paths move between releases. The attribute key itself is stable; one literal is cheaper than a broken import. |
 | **`metricReaders` vs `metricReader`** | Decides which side owns the provider — see §3.4. |
 | **Record the result** | Write the resolved versions into this section once installed, so the next reader knows which API the code targets. |
+
+##### Probe results — recorded 2026-10-12
+
+Installed with `npm i -E` (Node 24.18, Windows; image runs `node:20-alpine`):
+
+| Package | Version |
+|---|---|
+| `@opentelemetry/api` | 1.9.1 |
+| `sdk-node`, `instrumentation`, `instrumentation-http`, `exporter-prometheus`, `exporter-metrics-otlp-http` | 0.223.0 |
+| `sdk-metrics`, `sdk-trace-base`, `resources` | 2.12.0 |
+| `semantic-conventions` | 1.43.0 |
+| `instrumentation-express` / `-ioredis` / `-winston` | 0.71.0 / 0.71.0 / 0.67.0 |
+
+| Question | Answer | Consequence |
+|---|---|---|
+| Resource / semconv API | `resourceFromAttributes` + `ATTR_SERVICE_NAME` (2.x). No `Resource` class | Written against 2.x only |
+| `metricReaders` vs `metricReader` | `metricReaders` (plural); singular is deprecated | **NodeSDK owns the provider** (§3.4 preferred branch) |
+| Views | Plain `ViewOptions` objects with `AggregationType.EXPLICIT_BUCKET_HISTOGRAM` — there is **no `View` class** in sdk-metrics 2.x | §5 Phase 2d's `new View(...)` / `ExplicitBucketHistogramAggregation` snippet is 1.x API; `tracing.ts` uses the object form |
+| `OTEL_TRACES_EXPORTER` default | Unset → **`otlp`** when no span processor is given | No-op span processor is load-bearing, not belt-and-braces |
+| `OTEL_LOGS_EXPORTER` default | Unset → **`otlp`** when no `logRecordProcessors` are given — **not covered by the original plan** | `tracing.ts` passes `logRecordProcessors: []` (an empty array, not omitted) |
+| `OTEL_METRICS_EXPORTER` default | Unset → `otlp`, but only when `metricReaders` is absent | Explicit `metricReaders` bypasses it |
+| Express 5.2 | Supported (`>=4.0.0 <6`); `http.route="/health"` observed | ✅ |
+| ioredis 5 | Supported (`>=2.0.0 <7`) | ✅ |
+| winston 3 | Supported; `disableLogSending` / `disableLogCorrelation` present; `trace_id` observed on records under **both** CJS and tsx/ESM | ✅ |
+
+**Exposition naming differs from §5 Phase 2c — resolve before Phase 3.** With exporter 0.223.0:
+
+- `prefix: 'checkoutos'` applies to **every** metric, including instrumentation-owned ones: the HTTP histogram renders as `checkoutos_http_server_request_duration`, not `http_server_request_duration_seconds`.
+- **Units are not appended to names.** `unit: 's'` produces only a `# UNIT` metadata line. `gateway.request.duration` would render `checkoutos_gateway_request_duration`, not the `..._seconds` names in §6.
+- `_total` **is** appended to counters, as §5 Phase 2c says.
+
+Either name instruments with the unit in the name (`gateway.request.duration.seconds`), or accept unit-less names and update §6 and `docs/metrics.md`. Decide once, before the exposition snapshot (§7.3) freezes it.
+
+Other implementation notes:
+
+- **`getMeter()` before `sdk.start()` is a permanent no-op** — `@opentelemetry/api` has no proxy meter provider. `build.info` is registered by a function `tracing.ts` calls after `start()`.
+- **Instrumentation constructors patch immediately**, so under `NODE_ENV=test` `tracing.ts` constructs nothing, rather than constructing and not starting.
+- **`.env` loading:** the preload runs before `bootstrap.ts`, so `tracing.ts` loads dotenv itself, then reads `config/runtime.ts` via `loadRuntime()`. The logger keeps the `configureLogger()` inversion from `1b0ed1c` and never imports `runtime.ts` (§5 Phase 1a's `runtime.*` reads in `logger.ts` are superseded).
+- **The metrics listener ships in Phase 0**, not Phase 2 — the boot check and `verify-telemetry.mjs` both scrape it.
+- **Our own scrapes are excluded** from HTTP metrics via `ignoreIncomingRequestHook` on the metrics port.
+- `verify-telemetry.mjs` binds a trap on :4318 and fails if the app connects, which is stronger than checking that nothing is listening.
 
 ##### ⚠️ `pkg.version` will not compile here
 
@@ -1735,22 +1777,22 @@ Pre-existing defects found during verification that the phases above now fix:
 Every code block in this plan is a specification, not an illustration. In dependency order.
 
 **Phase 0-pre — the gate. Ship this even if nothing else here does.**
-- [ ] `dist/package.json` commonjs stamp in the `build` script
-- [ ] Prove it: `npm run build && node dist/server.js` reaches "server started"
-- [ ] `src/config/runtime.ts` (no imports); `logger.ts` reads `runtime`, not `config`
-- [ ] Prove it: `npx madge --extensions ts --circular src/server.ts` reports 0 cycles
-- [ ] `import/no-restricted-paths` — `logger.ts` and `src/telemetry/**` may not import `config/index.ts`
+- [x] `dist/package.json` commonjs stamp in the `build` script
+- [x] Prove it: `npm run build && node dist/server.js` reaches "server started"
+- [x] `src/config/runtime.ts` (no imports); `logger.ts` reads neither — it keeps the `configureLogger()` inversion (see Probe results)
+- [x] Prove it: `npx madge --extensions ts --circular src/server.ts` reports 0 cycles
+- [x] `import/no-restricted-paths` — `logger.ts` and `src/telemetry/**` may not import `config/index.ts`
 
 **Phase 0**
-- [ ] `npm i -E` the individual OTel packages (not `auto-instrumentations-node`)
-- [ ] Probe: resource/semconv API surface **and** `OTEL_*_EXPORTER` defaults; record both here
-- [ ] Decide provider ownership from `metricReaders` vs `metricReader` (§3.4); comment the choice in `tracing.ts`
-- [ ] `APP_VERSION`, `LOG_FORMAT`, `METRICS_PORT`, `METRICS_AUTH_TOKEN` → `env.schema.ts` + `runtime.ts` + `.env.example` + Docker build arg
-- [ ] `tracing.ts`: semconv opt-in, `NoopSpanProcessor`, `disableLogSending: true`, `if (!runtime.isTest) sdk.start()`, require-cache guard
-- [ ] `readers.ts`: `preventServerStart: true`, `prefix: 'checkoutos'`
-- [ ] `build.info` sentinel + boot assertion on `checkoutos_build_info` (with bearer header)
-- [ ] `scripts/verify-telemetry.mjs` against **both** `npm start` and `npm run dev`; wire into CI
-- [ ] `AGENTS.md`: telemetry layer, import restrictions, exporter isolation, *never instrument inside a plugin*, `SIGNATURE_FAILURE_CODES` in the gateway checklist
+- [x] `npm i -E` the individual OTel packages (not `auto-instrumentations-node`)
+- [x] Probe: resource/semconv API surface **and** `OTEL_*_EXPORTER` defaults; record both here
+- [x] Decide provider ownership from `metricReaders` vs `metricReader` (§3.4); comment the choice in `tracing.ts`
+- [x] `APP_VERSION`, `LOG_FORMAT`, `METRICS_PORT`, `METRICS_AUTH_TOKEN` → `env.schema.ts` + `runtime.ts` + `.env.example` + Docker build arg
+- [x] `tracing.ts`: semconv opt-in, `NoopSpanProcessor`, `disableLogSending: true`, `logRecordProcessors: []`, nothing constructed under test, require-cache guard
+- [x] `readers.ts`: `preventServerStart: true`, `prefix: 'checkoutos'`
+- [x] `build.info` sentinel + boot assertion on `checkoutos_build_info` (with bearer header)
+- [x] `scripts/verify-telemetry.mjs` against **both** `npm start` and `npm run dev` — [ ] wire into CI (no CI config in the repo yet)
+- [x] `AGENTS.md`: telemetry layer, import restrictions, exporter isolation, *never instrument inside a plugin* — [ ] `SIGNATURE_FAILURE_CODES` in the gateway checklist (lands with the decorator, Phase 3)
 
 **Phase 1a — own commit, quiet tree**
 - [ ] `logger.ts` rewrite (§5 Phase 1a) — signature unchanged, fields spread **first**

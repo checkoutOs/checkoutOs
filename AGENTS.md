@@ -7,7 +7,7 @@ description: checkoutOs is a redirect-based, SDK-less HTTP API payment orchestra
 You are an expert contributor for checkoutOs.
 
 Before writing code, always consult the project documentation:
-- `docs/adr/` — Architecture Decision Records (001 idempotency, 002 Paytm integration, 003 observability plan — *Proposed*, not implemented).
+- `docs/adr/` — Architecture Decision Records (001 idempotency, 002 Paytm integration, 003 observability plan — *Proposed*; Phase 0 implemented: `src/telemetry/`, `/metrics` on :9464; logs/metrics phases pending).
 - `projectSpec/` — architecture spec (`v1oArchitectureDesign.md`), contributor guide (`contributorguide.md`), build steps (`Steps.md`), gateway guide (`GatewayIntegrationGuide.md` — currently a duplicate of `Steps.md`), plus PDF handbooks.
 - `idempotency.md` (repo root) — full idempotency implementation plan.
 - `openapi.yaml` — public API contract. Update it when you change request/response shapes.
@@ -60,11 +60,15 @@ Utils
 - No side effects
 - `utils/logger.ts` must **not** import config/store/services/errors, nor `config/runtime.ts` (see "Startup import cycle" below)
 
-Telemetry (`src/telemetry/`, ADR 003 — in progress)
+Telemetry (`src/telemetry/`, ADR 003)
 
 - Peer layer of Store; emitting telemetry is a side effect, so it never lives in Utils
-- `tracing.ts` is the preloaded bootstrap: imports only `dotenv`, `config/runtime.ts` and `@opentelemetry/*` — never `config/index.ts`, the logger or app code (they would load before instrumentation)
+- `tracing.ts` is the preloaded bootstrap and the **only** file that names an exporter. Business code emits through the OTel API (`metrics.ts` instruments) and never names a destination
+- Telemetry imports only `dotenv`, `config/runtime.ts`, `@opentelemetry/*`, node built-ins and sibling telemetry modules — never `config/index.ts`, the logger or app code (they would load before instrumentation and go unpatched). Enforced by `import/no-restricted-paths`
 - `tracing.ts` loads `.env` itself, **then** calls `loadRuntime()`; other telemetry modules receive `runtime` as a parameter
+- Exactly one `MeterProvider`, owned by `NodeSDK`. Never construct one; never call `getMeter()` before `sdk.start()` (the API has no proxy — such a meter is a permanent no-op)
+- Under `NODE_ENV=test` nothing is constructed — instrumentation constructors patch modules immediately and would race the vitest `ioredis` mock
+- Metric labels will come only from `src/telemetry/attributes.ts` builders (ADR 003 §8.2, lands in Phase 4) — never `chkId`, `orderId`, gateway IDs or customer data as labels
 
 Middleware
 
@@ -104,6 +108,8 @@ Never modify service architecture to support one gateway.
 
 Gateway-specific behavior stays inside the plugin.
 
+Never add metrics or other instrumentation inside a plugin file. Gateway metrics come from the `withTelemetry()` decorator applied in `gateway.registry.ts` (ADR 003 §6.1, lands in Phase 3), so every gateway is instrumented the day it is registered.
+
 ---
 
 # When implementing features
@@ -123,16 +129,17 @@ Before coding:
 cp .env.example .env
 docker run -d --name checkoutos-redis -p 6379:6379 redis:7-alpine
 npm run mock:gateway    # MSW mock Razorpay + Paytm on :9090
-npm run dev             # tsx watch src/server.ts on :3000
+npm run dev             # tsx watch on :3000, /metrics on :9464
 ```
 To hit the mock instead of real gateways, set `RAZORPAY_BASE_URL=http://localhost:9090` (or `PAYTM_BASE_URL=http://localhost:9090`) in `.env`.
 
 ## Commands
 | Command | What it does |
 |---------|-------------|
-| `npm run dev` | Dev server with hot-reload via `tsx watch` |
-| `npm run build` | `tsc` → `dist/` |
-| `npm start` | Run compiled `dist/server.js` |
+| `npm run dev` | Dev server with hot-reload via `tsx watch`, telemetry preloaded via `--import ./src/telemetry/register.mjs` (ESM loader hook) |
+| `npm run build` | `tsc` → `dist/`, then writes `dist/package.json` `{"type":"commonjs"}` (without it Node parses the CJS output as ESM and `npm start` dies with `exports is not defined`) |
+| `npm start` | Run compiled `dist/server.js` with `--require ./dist/telemetry/tracing.js` |
+| `npm run verify:telemetry` | Builds, boots **both** `npm start` and `npm run dev` on :3100/:9564, asserts `/metrics` auth, `http_route="/health"`, `checkoutos_build_info` and no OTLP egress to :4318 — Redis required |
 | `npm run typecheck` | `tsc --noEmit` — strict mode |
 | `npm run lint:circular` | `madge --circular` over `src/` — detects import cycles |
 | `npm run mock:gateway` | MSW mock gateway server on :9090 (Razorpay + Paytm) |
@@ -152,15 +159,16 @@ There is no `lint` script — run `npx eslint .` directly.
 - `beforeEach` in integration setup deletes all `chk:*` keys from Redis — prevents cross-test contamination (also clears `chk:idem:*`, `chk:ref:*`).
 - `tests/helpers/app.helper.ts`: `createTestApp()` (singleton `buildApp()`) + `registerTestGateway()` (registers Razorpay, swallows errors) — does **not** call `initialise()`.
 - Env vars must be set at **top level** of setup files — `config/index.ts` parses env at import time.
-- Run order: `npm run test:unit && npm run test:integration`
+- Run order: `npm run test:unit && npm run test:integration && npm run verify:telemetry`
+- The OTel SDK never starts under vitest (`NODE_ENV=test`) — never import `src/telemetry/tracing` or `server.ts` from a test. Telemetry wiring is tested end to end by `verify:telemetry`, not by vitest.
 
 ## Architecture
 - **Express 5** app, `"type": "module"` in package.json (ESM sources, CommonJS output via `tsc`; `tsx` bridges the gap at dev time).
-- Entry: `src/server.ts` → `src/bootstrap.ts` (dotenv) → `configureLogger(config)` → `src/app.ts` (`initialise()` then `buildApp()`) → `listen`. SIGTERM/SIGINT trigger graceful shutdown (close server → disconnect Redis, 10 s force-exit).
+- Entry: preload `src/telemetry/tracing` (dotenv → OTel SDK → `/metrics` listener) → `src/server.ts` (imports `./telemetry` **first**, same instance) → `src/bootstrap.ts` (dotenv) → `configureLogger(config)` → `verifyTelemetry()` (scrapes own `/metrics`, refuses to boot without `checkoutos_build_info`) → `src/app.ts` (`initialise()` then `buildApp()`) → `listen`. SIGTERM/SIGINT trigger graceful shutdown (close server → disconnect Redis → `shutdownTelemetry()`, 10 s force-exit).
 - `initialise()` calls `registerGateways()` then `connectRedis()` — failure exits the process.
 - `buildApp()` is a pure factory with no side effects; safe to call in tests.
 - Layer: routes → (middleware) → controllers → services → `getActiveGateway()` (GatewayPlugin) + stores (Redis).
-- `@` path alias resolves to `./src` **only in Vitest** (`vitest.config.ts`); `src/` itself uses relative imports — keep it that way (tsc has no `paths` configured).
+- `@` path alias is declared in `vitest.config.ts` but does **not** resolve inside the `unit`/`integration` projects — tests use relative `../../../src/...` imports. `src/` itself uses relative imports — keep it that way (tsc has no `paths` configured).
 - Body parsing order in `src/app.ts`: request logger → `express.raw()` for `/webhooks/razorpay` → `express.urlencoded()` for `/webhooks/paytm` → mount webhook router → `express.json()` for all other routes → routes → `notFoundHandler` → `errorHandler` (last). **Order is load-sensitive.**
 - `src/middleware/request-logger.ts` is empty — request logging is inline in `buildApp()`.
 - Payment IDs: `chk_` prefix. Refund IDs: `ref_` prefix. Amounts in **paise** (₹500 = 50000). Only `INR` supported.
@@ -242,6 +250,8 @@ There is no `lint` script — run `npx eslint .` directly.
 - `tests/`: `explicit-function-return-type`, `no-non-null-assertion`, `ban-ts-comment`, `no-unused-vars` all off.
 - `mocks/`: `no-explicit-any` and `explicit-function-return-type` off.
 - Prettier: single quotes, semicolons, trailing commas, 100 print width.
+- `dist/` and `coverage/` are ignored. `scripts/**/*.mjs` and `src/**/*.mjs` get Node globals.
+- `import/no-restricted-paths` guards the telemetry boundaries (see Architecture Rules → Telemetry).
 - Pre-commit: husky runs `npx lint-staged` (`eslint --fix && prettier --write` on staged `*.{ts,js}`). Hooks install via the `prepare` script.
 
 ## Env config
@@ -262,6 +272,8 @@ There is no `lint` script — run `npx eslint .` directly.
 
 ## Docker
 - Root `Dockerfile`: multi-stage (`node:20-alpine`), non-root `checkoutos` user (uid/gid 1001), healthcheck on `/health`. Both stages run `npm pkg delete scripts.prepare` before `npm ci` so husky (a devDependency) doesn't break the build.
+- `CMD` preloads telemetry (`node --require ./dist/telemetry/tracing.js dist/server.js`). `APP_VERSION` is a build arg (`--build-arg APP_VERSION=...`), default `0.0.0`.
+- Port 9464 (`/metrics`) is `EXPOSE`d for documentation only and is **not** published by compose — scrape it on the compose network as `checkoutos:9464`.
 - `docker compose up` starts app + Redis. Compose overrides `REDIS_URL` to `redis://redis:6379`.
 - `docker compose --profile mock up` — **will fail**: references `Dockerfile.mock` which does not exist.
 - `docker/Dockerfile` and `docker/docker-compose.yml` are empty stubs.
@@ -275,3 +287,4 @@ There is no `lint` script — run `npx eslint .` directly.
 - `README.md` still lists only Razorpay/PayU/Cashfree and is behind the code (no Paytm, no idempotency).
 - `src/middleware/request-logger.ts`, `gateway.interface.ts`, `src/gateways/index.ts`, PayU/Cashfree files, and `helpers/docs/*.md` are empty.
 - Refund creation has no idempotency yet (planned for V1.2).
+- 9 integration tests fail on the current tree, independent of telemetry (reproduced on `ffdc74c`): 8 in `idempotency.test.ts` (Razorpay sandbox order creation returns 502) and `paytm.webhook.api.test.ts` "returns 401 when CHECKSUMHASH is invalid" (gets 200).
