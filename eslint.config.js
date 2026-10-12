@@ -3,6 +3,10 @@ import tseslint from 'typescript-eslint';
 import importPlugin from 'eslint-plugin-import';
 
 export default [
+  {
+    ignores: ['dist/**', 'coverage/**'],
+  },
+
   js.configs.recommended,
   ...tseslint.configs.recommended,
   ...tseslint.configs.strict,
@@ -58,6 +62,81 @@ export default [
       ],
 
       'import/no-default-export': 'error',
+    },
+  },
+
+  /**
+   * 🧱 TELEMETRY BOUNDARIES (ADR 003 §5 Phase 0)
+   * The telemetry bootstrap is preloaded before the app. Anything it imports
+   * loads before instrumentation and goes unpatched, and config/index.ts
+   * drags in env.schema → registry → plugins → winston. The logger takes its
+   * settings via configureLogger() instead of importing config.
+   */
+  {
+    files: ['src/**/*.ts'],
+
+    settings: {
+      'import/resolver': { node: { extensions: ['.ts', '.js'] } },
+    },
+
+    rules: {
+      'import/no-restricted-paths': [
+        'error',
+        {
+          zones: [
+            {
+              target: ['./src/telemetry', './src/utils/logger.ts'],
+              from: ['./src/config/index.ts', './src/config/env.schema.ts'],
+              message: 'Must not import config/index.ts — see ADR 003 §5 Phase 0.',
+            },
+            {
+              target: './src/telemetry',
+              from: [
+                './src/app.ts',
+                './src/server.ts',
+                './src/bootstrap.ts',
+                './src/controllers',
+                './src/routes',
+                './src/middleware',
+                './src/services',
+                './src/store',
+                './src/gateways',
+                './src/utils/logger.ts',
+              ],
+              message:
+                'Telemetry loads before the app — importing app code here leaves it unpatched (ADR 003 §5).',
+            },
+            {
+              target: [
+                './src/!(telemetry|config)/**/*',
+                './src/*.ts',
+                './src/config/index.ts',
+                './src/config/env.schema.ts',
+              ],
+              from: './src/config/runtime.ts',
+              message:
+                'config/runtime.ts is for src/telemetry/ only — everything else reads config.',
+            },
+          ],
+        },
+      ],
+    },
+  },
+
+  /**
+   * 📜 SCRIPTS + ESM preloads — plain Node ESM
+   */
+  {
+    files: ['scripts/**/*.mjs', 'src/**/*.mjs'],
+
+    languageOptions: {
+      sourceType: 'module',
+      globals: {
+        process: 'readonly',
+        console: 'readonly',
+        fetch: 'readonly',
+        AbortSignal: 'readonly',
+      },
     },
   },
 
