@@ -10,14 +10,16 @@
 #   docker compose down            # stop and remove containers
 #   docker compose logs -f         # follow logs
 #   docker compose logs checkoutos # logs for one service
+#   docker compose --profile metrics up -d --build
+#                                  # + Prometheus, Grafana on :3001 (ADR 003)
 #   docker compose --profile observability up -d --build
-#                                  # + Loki, Alloy, Grafana on :3001 (ADR 003)
+#                                  # + Loki and Alloy as well
 #
 # Prerequisites:
 #   cp .env.example .env
 #   Fill in RAZORPAY_* credentials or leave as-is for mock server usage
 
-# Observability stack (profile: observability). Every service in it is
+# Observability stack (profiles: metrics, observability). Every service in it is
 # profile-gated, so it adds nothing to a plain `docker compose up`.
 include:
   - observability/docker-compose.observability.yml

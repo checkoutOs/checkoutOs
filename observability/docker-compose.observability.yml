@@ -1,21 +1,52 @@
 # observability/docker-compose.observability.yml
-# Log pipeline for checkoutOs (ADR 003 §5 Phase 1, §10):
+# Local observability stack for checkoutOs (ADR 003 §5 Phases 1–2, §10.1).
+# Included from the root docker-compose.yml. Tiered profiles — each a superset
+# of the previous one; a plain `docker compose up` starts none of this:
 #
-#   checkoutos stdout (JSON) → Docker json-file → Alloy → Loki → Grafana
+#   docker compose --profile metrics up -d --build        # + Prometheus, Grafana
+#   docker compose --profile observability up -d --build  # + Loki, Alloy
 #
-# Included from the root docker-compose.yml. Every service here is behind the
-# `observability` profile, so a plain `docker compose up` is unchanged:
+#   metrics:  checkoutos:9464/metrics → Prometheus → Grafana
+#   logs:     checkoutos stdout (JSON) → Docker json-file → Alloy → Loki → Grafana
 #
-#   docker compose --profile observability up -d --build
-#   open http://localhost:3001  → Explore → Loki
-#     {service="checkoutos"}
-#     {service="checkoutos"} | trace_id="<id>"     ← every line of one request
+#   open http://localhost:3001  → Explore
+#     Prometheus: checkoutos_http_server_request_duration_count
+#     Loki:       {service="checkoutos"} | trace_id="<id>"   ← one request's lines
 #
 # Only Grafana is published, and only on 127.0.0.1: it runs with anonymous
-# admin access for local use. Loki and Alloy stay on the compose network.
+# admin access for local use. Prometheus, Loki and Alloy stay on the compose
+# networks, and the app's 9464 is never published (ADR 003 §3.5).
 # Never run this file as-is on a shared host.
 
 services:
+  # ── Prometheus — scrapes /metrics ──────────────────────────────────────────
+  # Joins checkoutos-network to reach checkoutos:9464, and observability so
+  # Grafana can query it.
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    container_name: checkoutos-prometheus
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      # 7 days, like Loki. Retention is the disk-growth control (ADR 003 §10.1).
+      - --storage.tsdb.retention.time=7d
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    healthcheck:
+      test: ['CMD-SHELL', 'wget -qO- http://localhost:9090/-/ready | grep -qi ready']
+      interval: 10s
+      timeout: 5s
+      start_period: 20s
+      retries: 10
+    networks:
+      - checkoutos-network
+      - observability
+    profiles:
+      - metrics
+      - observability
+
   # ── Loki — log store ───────────────────────────────────────────────────────
   loki:
     image: grafana/loki:3.5.0
@@ -62,7 +93,8 @@ services:
       - observability
 
   # ── Grafana — query UI ─────────────────────────────────────────────────────
-  # Port 3001: 3000 is the checkoutOs API.
+  # Port 3001: 3000 is the checkoutOs API. Both datasources are always
+  # provisioned; Loki simply has no data under the metrics profile.
   grafana:
     image: grafana/grafana:12.1.0
     container_name: checkoutos-grafana
@@ -79,21 +111,29 @@ services:
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
       - grafana_data:/var/lib/grafana
     depends_on:
+      prometheus:
+        condition: service_healthy
+      # Not started under the metrics profile — required: false lets Grafana
+      # run without it.
       loki:
         condition: service_healthy
+        required: false
     networks:
       - observability
     profiles:
+      - metrics
       - observability
 
 volumes:
+  prometheus_data:
   loki_data:
   alloy_data:
   grafana_data:
 
-# Separate from checkoutos-network: Alloy collects through the Docker socket,
-# not over the network, so nothing here needs to reach the app. (Prometheus
-# scraping checkoutos:9464 in Phase 2 will join checkoutos-network.)
 networks:
+  # Declared identically in the root docker-compose.yml; compose merges them.
+  # Only Prometheus joins it — Alloy collects through the Docker socket.
+  checkoutos-network:
+    driver: bridge
   observability:
     driver: bridge
