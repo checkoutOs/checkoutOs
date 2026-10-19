@@ -20,6 +20,9 @@ import type { GatewayPlugin } from '../types/gateway.types';
 import { GatewayUnavailableError } from '../errors/gateways.errors';
 import { createRazorpayPlugin, type RazorpayConfig } from './razorpay/razorpay.plugin';
 import { createPaytmPlugin, type PaytmConfig } from './paytm/paytm.plugin';
+// Gateway metrics for every plugin (ADR 003 §6.1). Wrap every plugin you add
+// below — plugins never record metrics themselves.
+import { withTelemetry } from '../telemetry/gateway.decorator';
 
 // ---------------------------------------------------------------------------
 // Supported gateways
@@ -159,7 +162,7 @@ export function registerGateways(
         },
         baseUrl,
       };
-      gatewayPlugins['razorpay'] = createRazorpayPlugin(razorpayConfig);
+      gatewayPlugins['razorpay'] = withTelemetry(createRazorpayPlugin(razorpayConfig));
       break;
     }
 
@@ -177,7 +180,7 @@ export function registerGateways(
             websiteName: env['PAYTM_WEBSITE_NAME'],
           }),
       };
-      gatewayPlugins['paytm'] = createPaytmPlugin(paytmConfig);
+      gatewayPlugins['paytm'] = withTelemetry(createPaytmPlugin(paytmConfig));
       break;
     }
 
