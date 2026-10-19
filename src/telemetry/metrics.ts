@@ -6,6 +6,7 @@
 //   - Names are dotted with a base unit; the Prometheus exporter adds the
 
 import { metrics, type Meter } from '@opentelemetry/api';
+import { buildInfoLabels } from './attributes';
 
 export const METER_NAME = 'checkoutos';
 
@@ -28,6 +29,6 @@ export function registerBuildInfo(version: string): void {
       description: 'Always 1. Labelled with the running checkoutOs version.',
     })
     .addCallback((result): void => {
-      result.observe(1, { version });
+      result.observe(1, buildInfoLabels(version));
     });
 }
