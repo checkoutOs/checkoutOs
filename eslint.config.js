@@ -2,17 +2,39 @@ import js from '@eslint/js';
 import tseslint from 'typescript-eslint';
 import importPlugin from 'eslint-plugin-import';
 
-/**
- * Log event names (ADR 003 §5 Phase 1a): dotted, lowercase, underscores allowed
- * within a segment, at least one dot — payment.created, webhook.relay_failed,
- * http.error.operational. Exported so tests/unit/lint/log-events.test.ts can
- * validate it against every event name in the codebase. Keep in sync with
- * PATTERN in scripts/log-events.mjs (the test checks that too).
- */
 export const LOG_EVENT_PATTERN = /^[a-z][a-z0-9]*(_[a-z0-9]+)*(\.[a-z][a-z0-9]*(_[a-z0-9]+)*)+$/;
 
 // Context loggers are always bound to `log` (const log = createContextLogger(...)).
 const LOG_CALL = "CallExpression[callee.type='MemberExpression'][callee.object.name='log']";
+
+const LOG_EVENT_RULES = [
+  {
+    selector: `${LOG_CALL} > :first-child:not(Literal)`,
+    message:
+      'Log event names must be static string literals (move dynamic values into fields) — see ADR 003 §5 Phase 1a',
+  },
+  {
+    selector: `${LOG_CALL} > Literal:first-child:not([value=/${LOG_EVENT_PATTERN.source}/])`,
+    message:
+      'Log event must be dotted lowercase, e.g. payment.created or webhook.relay_failed — see ADR 003 §5 Phase 1a',
+  },
+];
+
+// Metric labels come only from src/telemetry/attributes.ts builders (ADR 003
+// §8.2): an object literal passed to .add/.record/.observe is the cardinality
+// bug. Scoped to services, middleware and telemetry so Set.prototype.add
+// elsewhere stays legal. Pinned by tests/unit/lint/metric-labels.test.ts.
+export const METRIC_LABEL_FILES = [
+  'src/services/**/*.ts',
+  'src/middleware/**/*.ts',
+  'src/telemetry/**/*.ts',
+];
+
+const METRIC_LABEL_RULE = {
+  selector: 'CallExpression[callee.property.name=/^(add|record|observe)$/] > ObjectExpression',
+  message:
+    'Metric attributes must come from a src/telemetry/attributes.ts builder (gatewayLabels, webhookLabels, httpLabels) — see ADR 003 §8.2',
+};
 
 export default [
   {
@@ -55,9 +77,6 @@ export default [
     },
   },
 
-  /**
-   * 🔴 STRICT RULES — ONLY for production code
-   */
   {
     files: ['src/**/*.ts'],
 
@@ -75,24 +94,25 @@ export default [
 
       'import/no-default-export': 'error',
 
-      'no-restricted-syntax': [
-        'error',
-        {
-          selector: `${LOG_CALL} > :first-child:not(Literal)`,
-          message:
-            'Log event names must be static string literals (move dynamic values into fields) — see ADR 003 §5 Phase 1a',
-        },
-        {
-          selector: `${LOG_CALL} > Literal:first-child:not([value=/${LOG_EVENT_PATTERN.source}/])`,
-          message:
-            'Log event must be dotted lowercase, e.g. payment.created or webhook.relay_failed — see ADR 003 §5 Phase 1a',
-        },
-      ],
+      'no-restricted-syntax': ['error', ...LOG_EVENT_RULES],
     },
   },
 
   /**
-   * 🧱 TELEMETRY BOUNDARIES (ADR 003 §5 Phase 0)
+   * 📏 METRIC LABEL GUARDRAIL (ADR 003 §8.2)
+   * A later block REPLACES no-restricted-syntax instead of merging it, so the
+   * log-event selectors are repeated here — otherwise these files lose them.
+   */
+  {
+    files: METRIC_LABEL_FILES,
+
+    rules: {
+      'no-restricted-syntax': ['error', ...LOG_EVENT_RULES, METRIC_LABEL_RULE],
+    },
+  },
+
+  /**
+   * 🧱 TELEMETRY BOUNDARIES
    * The telemetry bootstrap is preloaded before the app. Anything it imports
    * loads before instrumentation and goes unpatched, and config/index.ts
    * drags in env.schema → registry → plugins → winston. The logger takes its
@@ -167,7 +187,7 @@ export default [
   },
 
   /**
-   * 🎭 MOCKS — relaxed (infra/testing helpers)
+   *  MOCKS — relaxed (infra/testing helpers)
    */
   {
     files: ['mocks/**/*.ts'],
@@ -179,7 +199,7 @@ export default [
   },
 
   /**
-   * 🧪 TESTS — relaxed rules
+   * TESTS — relaxed rules
    */
   {
     files: ['tests/**/*.ts'],
@@ -193,7 +213,7 @@ export default [
   },
 
   /**
-   * ⚙️ CONFIG FILES — allow default exports
+   * CONFIG FILES  allow default exports
    */
   {
     files: ['*.config.ts', 'vitest.*.ts'],
@@ -204,7 +224,7 @@ export default [
   },
 
   /**
-   * ✅ Special case: app.ts can use default export
+   * Special case: app.ts can use default export
    */
   {
     files: ['src/app.ts'],
