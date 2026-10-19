@@ -27,11 +27,6 @@ import { disconnectRedis } from './store/redis.client';
 import { config } from './config';
 import { configureLogger, createContextLogger } from './utils/logger';
 
-console.log('ENV DEBUG:', {
-  ACTIVE_GATEWAY: process.env.ACTIVE_GATEWAY,
-  REDIS_URL: process.env.REDIS_URL,
-  WEBHOOK_RELAY_URL: process.env.WEBHOOK_RELAY_URL,
-});
 const log = createContextLogger('server');
 
 async function start(): Promise<void> {

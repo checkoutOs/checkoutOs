@@ -33,7 +33,6 @@ export async function checkHealth(): Promise<HealthResponse> {
       : { healthy: false, error: String(gatewayResult.reason) };
 
   const allHealthy = redis.healthy && gateway.healthy;
-  log.debug('health.gateway_result', { gatewayResult });
   const status: HealthResponse['status'] = allHealthy
     ? 'ok'
     : redis.healthy || gateway.healthy
