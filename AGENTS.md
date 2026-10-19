@@ -7,7 +7,8 @@ description: checkoutOs is a redirect-based, SDK-less HTTP API payment orchestra
 You are an expert contributor for checkoutOs.
 
 Before writing code, always consult the project documentation:
-- `docs/adr/` — Architecture Decision Records (001 idempotency, 002 Paytm integration, 003 observability plan — *Proposed*; Phases 0, 1a, 1b implemented: `src/telemetry/`, `/metrics` on :9464, structured event logs, `observability/` Loki stack; metrics phases pending).
+- `docs/adr/` — Architecture Decision Records (001 idempotency, 002 Paytm integration, 003 observability plan — *Proposed*; Phases 0–4 implemented: `src/telemetry/`, `/metrics` on :9464, structured event logs, `observability/` Prometheus/Loki stack, exposition snapshot, label guardrails, domain metrics; dashboards/alerts (5) and traces (6) pending).
+- `docs/metrics.md` — **the user-facing metric contract**: every metric, type, unit, labels, allowed values, buckets, and the stability policy. Update it with any metric change.
 - `projectSpec/` — architecture spec (`v1oArchitectureDesign.md`), contributor guide (`contributorguide.md`), build steps (`Steps.md`), gateway guide (`GatewayIntegrationGuide.md` — currently a duplicate of `Steps.md`), plus PDF handbooks.
 - `idempotency.md` (repo root) — full idempotency implementation plan.
 - `openapi.yaml` — public API contract. Update it when you change request/response shapes.
@@ -57,6 +58,7 @@ Gateway
 Utils
 
 - Pure functions
+- `utils/redact.ts` — `redactWebhookEvent(event)` returns `{ gateway, event, status, amount, currency }`: no `raw`, no gateway IDs. Use it for **anything** derived from a `WebhookEvent` that is logged, put on a span, or sent out. It is an allow-list (`WEBHOOK_EVENT_FIELDS` must decide every `WebhookEvent` key), so a new `WebhookEvent` field is a compile error until classified
 - No side effects
 - `utils/logger.ts` must **not** import config/store/services/errors, nor `config/runtime.ts` (see "Startup import cycle" below)
 
@@ -64,11 +66,14 @@ Telemetry (`src/telemetry/`, ADR 003)
 
 - Peer layer of Store; emitting telemetry is a side effect, so it never lives in Utils
 - `tracing.ts` is the preloaded bootstrap and the **only** file that names an exporter. Business code emits through the OTel API (`metrics.ts` instruments) and never names a destination
-- Telemetry imports only `dotenv`, `config/runtime.ts`, `@opentelemetry/*`, node built-ins and sibling telemetry modules — never `config/index.ts`, the logger or app code (they would load before instrumentation and go unpatched). Enforced by `import/no-restricted-paths`
+- Telemetry imports only `dotenv`, `config/runtime.ts`, `@opentelemetry/*`, node built-ins, sibling telemetry modules and `import type` from `src/types/` (erased at runtime) — never `config/index.ts`, the logger or app code (they would load before instrumentation and go unpatched). Enforced by `import/no-restricted-paths`
 - `tracing.ts` loads `.env` itself, **then** calls `loadRuntime()`; other telemetry modules receive `runtime` as a parameter
-- Exactly one `MeterProvider`, owned by `NodeSDK`. Never construct one; never call `getMeter()` before `sdk.start()` (the API has no proxy — such a meter is a permanent no-op)
+- Exactly one `MeterProvider`, owned by `NodeSDK`. Never construct one in `src/`; never call `getMeter()` before `sdk.start()` (the API has no proxy — such a meter is a permanent no-op)
+- Business instruments are all defined in `metrics.ts` and reached through `telemetry()` (lazy, memoised — call it at record time, never at module load). Names are dotted with **no unit suffix** (set `unit: 's'`; exporter 0.223 renders no `_seconds`), counters never end in `_total` (the exporter adds it). Time with `process.hrtime.bigint()` + `secondsSince()`
+- Webhook processing time is recorded **before** the relay call; relay time has its own histogram. Never nest them
 - Under `NODE_ENV=test` nothing is constructed — instrumentation constructors patch modules immediately and would race the vitest `ioredis` mock
-- Metric labels will come only from `src/telemetry/attributes.ts` builders (ADR 003 §8.2, lands in Phase 4) — never `chkId`, `orderId`, gateway IDs or customer data as labels
+- Metric labels come **only** from `src/telemetry/attributes.ts` builders (ADR 003 §8.2): `gatewayLabels(gateway, operation, outcome)`, `webhookLabels(gateway)`, `httpLabels(method, route, status)`, `buildInfoLabels(version)`. Each value is closed twice — a union type at compile time, and at run time anything outside the set collapses to `unknown` / `_OTHER` / `unmatched` instead of becoming a new series. Builders never throw. Never `chkId`, `orderId`, gateway IDs, raw paths or customer data as labels
+- `METRIC_GATEWAYS` mirrors `supportedGateways` and `HTTP_ROUTES` mirrors the routers mounted in `app.ts` (not imported — telemetry must not load the registry). `tests/unit/telemetry/attributes.test.ts` fails on drift: **adding a gateway or a route means adding it there too**
 
 Middleware
 
@@ -103,12 +108,15 @@ Every new gateway must include
 - registration
 - webhook verification
 - mock handlers (`mocks/gateways/<gateway>/handlers.ts`)
+- `withTelemetry(...)` around the plugin at its `gatewayPlugins[...] =` line in `gateway.registry.ts`
+- its webhook signature-failure **error code** in `SIGNATURE_FAILURE_CODES` (`src/telemetry/gateway.decorator.ts`) if it throws one other than `GATEWAY_INVALID_SIGNATURE` — classification is by code, never by class, and this is the one thing the decorator cannot infer
+- its name in `METRIC_GATEWAYS` and its webhook event names in `WEBHOOK_EVENTS` (`src/telemetry/attributes.ts`) — `attributes.test.ts` fails until they match
 
 Never modify service architecture to support one gateway.
 
 Gateway-specific behavior stays inside the plugin.
 
-Never add metrics or other instrumentation inside a plugin file. Gateway metrics come from the `withTelemetry()` decorator applied in `gateway.registry.ts` (ADR 003 §6.1, lands in Phase 3), so every gateway is instrumented the day it is registered.
+Never add metrics or other instrumentation inside a plugin file. Gateway metrics (`gateway.request.duration`, `gateway.requests`, `webhook.signature_failures`) come from the `withTelemetry()` decorator applied in `gateway.registry.ts` (ADR 003 §6.1), so every gateway is instrumented the day it is registered. The decorator `.bind(plugin)`s every method (plugins are classes using `this`), keeps `parseWebhookEvent` **synchronous**, passes `getCheckoutAction` through, and classifies outcomes by error code (`GATEWAY_TIMEOUT` → `timeout`, `GATEWAY_MAPPING_ERROR` → `mapping_error`, anything else → `gateway_error`). `getActiveGateway()` returns the wrapper, not the plugin instance — never `instanceof` it.
 
 ---
 
@@ -131,7 +139,7 @@ docker run -d --name checkoutos-redis -p 6379:6379 redis:7-alpine
 npm run mock:gateway    # MSW mock Razorpay + Paytm on :9090
 npm run dev             # tsx watch on :3000, /metrics on :9464
 ```
-Logs in Grafana/Loki: `docker compose --profile observability up -d --build` → `http://localhost:3001` (see Docker).
+Metrics/logs in Grafana: `docker compose --profile metrics up -d --build` (or `--profile observability` for logs too) → `http://localhost:3001` (see Docker).
 To hit the mock instead of real gateways, set `RAZORPAY_BASE_URL=http://localhost:9090` (or `PAYTM_BASE_URL=http://localhost:9090`) in `.env`.
 
 ## Commands
@@ -140,7 +148,7 @@ To hit the mock instead of real gateways, set `RAZORPAY_BASE_URL=http://localhos
 | `npm run dev` | Dev server with hot-reload via `tsx watch`, telemetry preloaded via `--import ./src/telemetry/register.mjs` (ESM loader hook) |
 | `npm run build` | `tsc` → `dist/`, then writes `dist/package.json` `{"type":"commonjs"}` (without it Node parses the CJS output as ESM and `npm start` dies with `exports is not defined`) |
 | `npm start` | Run compiled `dist/server.js` with `--require ./dist/telemetry/tracing.js` |
-| `npm run verify:telemetry` | Builds, boots **both** `npm start` and `npm run dev` on :3100/:9564, asserts `/metrics` auth, `http_route="/health"`, `checkoutos_build_info` and no OTLP egress to :4318 — Redis required |
+| `npm run verify:telemetry` | Builds, boots **both** `npm start` and `npm run dev` on :3100/:9564 against a local stub gateway (:9590 — no gateway creds/internet needed), drives a short business flow (create payment, idempotent replay, orderId dedup, forged + signed + replayed + unknown webhooks, refund — relay always to a refused local port), asserts `/metrics` auth, `http_route="/health"`, `checkoutos_build_info`, one HTTP histogram with the semconv label keys, every business metric family the flow should produce, no OTLP egress to :4318, and identical metric shapes for both entry points; then (re)writes `observability/exposition.snapshot.txt`. Add `-- --check` to fail instead of writing (CI does). Redis required |
 | `npm run typecheck` | `tsc --noEmit` — strict mode |
 | `npm run lint:circular` | `madge --circular` over `src/` — detects import cycles |
 | `npm run mock:gateway` | MSW mock gateway server on :9090 (Razorpay + Paytm) |
@@ -161,8 +169,10 @@ There is no `lint` script — run `npx eslint .` directly.
 - `beforeEach` in integration setup deletes all `chk:*` keys from Redis — prevents cross-test contamination (also clears `chk:idem:*`, `chk:ref:*`).
 - `tests/helpers/app.helper.ts`: `createTestApp()` (singleton `buildApp()`) + `registerTestGateway()` (registers Razorpay, swallows errors) — does **not** call `initialise()`.
 - Env vars must be set at **top level** of setup files — `config/index.ts` parses env at import time.
-- Run order: `npm run test:unit && npm run test:integration && npm run verify:telemetry`
+- Run order: `npm run test:unit && npm run test:integration && npm run verify:telemetry` — the same chain runs in CI (`.github/workflows/ci.yml`, after typecheck, eslint, `lint:circular` and `log-events.mjs check`). CI is red until the 9 known integration failures (Known issues) are fixed.
+- **Exposition snapshot** (`observability/exposition.snapshot.txt`, ADR 003 §7.3): the *shape* of `/metrics` — metric names, HELP/UNIT/TYPE, label **keys**, histogram `le` boundaries; never values. Generated, never hand-edited. Any metric rename, new label or bucket change shows up as a diff here: review it as a public-contract change and commit it with the code, or CI fails. `target_info` keeps only `service_*`/`deployment_*` keys (host/process detector keys vary by OS).
 - The OTel SDK never starts under vitest (`NODE_ENV=test`) — never import `src/telemetry/tracing` or `server.ts` from a test. Telemetry wiring is tested end to end by `verify:telemetry`, not by vitest.
+- To assert on metrics in a unit test, call `installTestMeterProvider()` from `tests/helpers/metrics.helper.ts` at the **top** of the file (before anything records — `telemetry()` memoises) and assert with `delta(name, labels, fn)` (values are cumulative). Examples: `tests/unit/telemetry/gateway.decorator.test.ts`, `tests/unit/services/webhook.service.metrics.test.ts`.
 
 ## Architecture
 - **Express 5** app, `"type": "module"` in package.json (ESM sources, CommonJS output via `tsc`; `tsx` bridges the gap at dev time).
@@ -172,7 +182,7 @@ There is no `lint` script — run `npx eslint .` directly.
 - Layer: routes → (middleware) → controllers → services → `getActiveGateway()` (GatewayPlugin) + stores (Redis).
 - `@` path alias is declared in `vitest.config.ts` but does **not** resolve inside the `unit`/`integration` projects — tests use relative `../../../src/...` imports. `src/` itself uses relative imports — keep it that way (tsc has no `paths` configured).
 - Body parsing order in `src/app.ts`: request logger → `express.raw()` for `/webhooks/razorpay` → `express.urlencoded()` for `/webhooks/paytm` → mount webhook router → `express.json()` for all other routes → routes → `notFoundHandler` → `errorHandler` (last). **Order is load-sensitive.**
-- `src/middleware/request-logger.ts` is empty — request logging is inline in `buildApp()`.
+- `src/middleware/request-logger.ts` — `requestLogger`, mounted first in `buildApp()`; logs `http.request.completed` (component `request-logger`). **Logs only, no metrics**: HTTP duration is `http.server.request.duration` from `HttpInstrumentation` (labels `http_route`, `http_request_method`, `http_response_status_code`). Never define a second HTTP duration histogram — a duplicate family makes Prometheus reject the whole scrape; `verify:telemetry` fails on it.
 - Payment IDs: `chk_` prefix. Refund IDs: `ref_` prefix. Amounts in **paise** (₹500 = 50000). Only `INR` supported.
 - `GET /checkout/:chkId` serves **HTML**, not JSON. The controller asks the plugin's `getCheckoutAction()`: Razorpay returns `{ type: 'render' }` (JS SDK page), Paytm returns `{ type: 'redirect', url }`.
 
@@ -209,7 +219,7 @@ There is no `lint` script — run `npx eslint .` directly.
 - **Razorpay**: implemented (`src/gateways/razorpay/`), registered. Webhooks are HMAC-SHA256 over the raw JSON body.
 - **Paytm**: implemented (`src/gateways/paytm/`, uses `paytmchecksum`), **registered** in `gateway.registry.ts`. Webhooks are URL-encoded with `CHECKSUMHASH`. `websiteName` comes from `PAYTM_WEBSITE_NAME` (defaults to `WEBSTAGING` sandbox — set `DEFAULT` or your assigned name in production). `getRefundStatus()` always throws `GatewayUnavailableError` (refund status arrives only via webhook). Paytm-specific errors live in `src/errors/paytm.errors.ts`.
 - **PayU, Cashfree**: plugin + mapper files are **empty**; `registerGateways` throws for both at startup.
-- `src/gateways/gateway.registry.ts` — single source of truth for supported gateway names, required env keys, credential key maps, and base URLs (+ `*_BASE_URL` override). It must never import `config/index.ts` or read `process.env`. Adding a gateway = registry entry + `switch` case + plugin; no service/controller changes.
+- `src/gateways/gateway.registry.ts` — single source of truth for supported gateway names, required env keys, credential key maps, and base URLs (+ `*_BASE_URL` override). It must never import `config/index.ts` or read `process.env`. Adding a gateway = registry entry + `switch` case (wrapped in `withTelemetry`) + plugin + its telemetry closed sets; no service/controller changes.
 - `GatewayPlugin` interface lives in `src/types/gateway.types.ts` (`createPayment`, `getPaymentStatus`, `createRefund`, `getRefundStatus`, `parseWebhookEvent`, `getCheckoutAction`, `healthCheck`). `gateway.interface.ts` and `src/gateways/index.ts` are empty.
 - Services never import gateway folders directly — always call `getActiveGateway()`.
 - `ACTIVE_GATEWAY` env var selects the active gateway; Zod `superRefine` makes its `requiredEnvKeys` mandatory at startup (Paytm requires only merchant ID + key; webhook secret optional).
@@ -225,7 +235,7 @@ There is no `lint` script — run `npx eslint .` directly.
   - SUCCESS / FAILED / CANCELLED / EXPIRED / REFUNDED / PARTIALLY_REFUNDED → (terminal, no transitions)
 - Redis state is always updated **before** the relay is attempted.
 - Webhook relay to `WEBHOOK_RELAY_URL` is fire-and-forget (5 s timeout); relay failure logs a warning and does not fail the request.
-- Relay payload uses `chk_` IDs — raw gateway IDs are never forwarded.
+- Relay payload is `{ paymentId: chkId, ...event }` — the spread **also forwards `raw` (the full gateway payload), `gatewayPaymentId` and `gatewayOrderId`** to `WEBHOOK_RELAY_URL`. Pre-existing; changing it changes the merchant-facing payload (needs a decision + `openapi.yaml`). `redactWebhookEvent()` is the helper that would fix it.
 
 ## Errors
 - Base: abstract `AppError` (`src/errors/app.errors.ts`) with `httpStatus`, `code` (from `ErrorCode` in `types/common.types.ts`), `details`, `isOperational`.
@@ -264,6 +274,8 @@ There is no `lint` script — run `npx eslint .` directly.
 - `dist/` and `coverage/` are ignored. `scripts/**/*.mjs` and `src/**/*.mjs` get Node globals.
 - `import/no-restricted-paths` guards the telemetry boundaries (see Architecture Rules → Telemetry).
 - `no-restricted-syntax` on `src/**/*.ts`: the first argument of any `log.*(...)` / `log[level](...)` call must be a string literal matching `LOG_EVENT_PATTERN` (see Logging conventions).
+- `no-restricted-syntax` on `METRIC_LABEL_FILES` (services, middleware, telemetry): no object literal as an argument to `.add` / `.record` / `.observe` — use an `attributes.ts` builder. Pinned by `tests/unit/lint/metric-labels.test.ts`.
+  - ⚠️ A later flat-config block **replaces** `no-restricted-syntax` for its files instead of merging. Any block that sets it must spread `LOG_EVENT_RULES` too (the fixture test fails otherwise).
 - Pre-commit: husky runs `npx lint-staged` (`eslint --fix && prettier --write` on staged `*.{ts,js}`). Hooks install via the `prepare` script.
 
 ## Env config
@@ -288,7 +300,8 @@ There is no `lint` script — run `npx eslint .` directly.
 - Port 9464 (`/metrics`) is `EXPOSE`d for documentation only and is **not** published by compose — scrape it on the compose network as `checkoutos:9464`.
 - `docker compose up` starts app + Redis. Compose overrides `REDIS_URL` to `redis://redis:6379`.
 - `docker compose --profile mock up` — **will fail**: references `Dockerfile.mock` which does not exist.
-- `docker compose --profile observability up -d --build` adds Loki + Alloy + Grafana (`observability/`, pulled in by `include:` in the root compose file). Grafana: `http://localhost:3001` (127.0.0.1 only, anonymous admin — local use only). Loki/Alloy are not published. Query one request with `{service="checkoutos"} | trace_id="<id>"`.
+- Tiered profiles (`observability/`, pulled in by `include:` in the root compose file; each a superset): `docker compose --profile metrics up -d --build` adds Prometheus + Grafana; `--profile observability` adds Loki + Alloy as well. Grafana: `http://localhost:3001` (127.0.0.1 only, anonymous admin — local use only; Prometheus is the default datasource). Prometheus, Loki and Alloy are not published.
+  - Prometheus joins `checkoutos-network` (declared identically in both compose files — compose merges them) and scrapes `checkoutos:9464` every 15 s, 7-day retention. No scrape auth by default; if `METRICS_AUTH_TOKEN` is set, enable the commented `authorization` block in `observability/prometheus/prometheus.yml`. Query one request with `{service="checkoutos"} | trace_id="<id>"`.
   - Pipeline: app stdout JSON → Docker `json-file` (rotated: `max-size 10m`, `max-file 5`) → Alloy (`loki.source.docker`, Docker socket, filters on `com.docker.compose.service=checkoutos`) → Loki 3 (tsdb/v13, 7-day retention).
   - Loki **labels** (bounded): `service`, `env`, `level`, `component`, `compose_service`. **Structured metadata**: `trace_id`, `span_id`, `event`. Never promote IDs to labels.
   - `trace_id` is present on every line logged inside a request; startup/shutdown lines have none (no active span).
@@ -300,6 +313,6 @@ There is no `lint` script — run `npx eslint .` directly.
 - `src/services/health.service.ts` imports `pingRedis` straight from `store/redis.client.ts`, although that file says services must not import it directly.
 - `vitest.setup.integration.ts` commits Razorpay test-mode credentials and points integration tests at the real sandbox (see Testing).
 - `README.md` still lists only Razorpay/PayU/Cashfree and is behind the code (no Paytm, no idempotency).
-- `src/middleware/request-logger.ts`, `gateway.interface.ts`, `src/gateways/index.ts`, PayU/Cashfree files, and `helpers/docs/*.md` are empty.
+- `gateway.interface.ts`, `src/gateways/index.ts`, PayU/Cashfree files, and `helpers/docs/*.md` are empty.
 - Refund creation has no idempotency yet (planned for V1.2).
 - 9 integration tests fail on the current tree, independent of telemetry (reproduced on `ffdc74c`): 8 in `idempotency.test.ts` (Razorpay sandbox order creation returns 502) and `paytm.webhook.api.test.ts` "returns 401 when CHECKSUMHASH is invalid" (gets 200).
