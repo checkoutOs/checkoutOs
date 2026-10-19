@@ -17,6 +17,9 @@
 // orchestrator (Docker, Kubernetes) detects the failure and restarts the pod.
 //
 
+// MUST stay the first import — starts the OTel SDK before express, winston and
+// ioredis load if it was not already preloaded (see src/telemetry/tracing.ts).
+import { shutdownTelemetry, verifyTelemetry } from './telemetry';
 import './bootstrap';
 
 import { buildApp, initialise } from './app';
@@ -43,6 +46,8 @@ async function start(): Promise<void> {
     env: config.env,
     version: config.app.version,
     ...(config.log.format !== undefined && { format: config.log.format }),
+    // No LOG_FORMAT → pretty only on a terminal; JSON for anything shipped.
+    isTTY: process.stdout.isTTY === true,
   });
 
   // --- Refuse to boot with dead telemetry (ADR 003 §3.4) ---
@@ -58,7 +63,7 @@ async function start(): Promise<void> {
 
   // --- Start listening ---
   const server = app.listen(config.port, (): void => {
-    log.info('checkoutOs server started', {
+    log.info('server.started', {
       port: config.port,
       env: config.env,
       gateway: config.gateway.active,
@@ -69,24 +74,24 @@ async function start(): Promise<void> {
   // Called on SIGTERM (Docker stop, Kubernetes pod termination)
   // and SIGINT (Ctrl+C in development).
   async function shutdown(signal: string): Promise<void> {
-    log.info(`${signal} received — shutting down gracefully`);
+    log.info('server.shutdown_started', { signal });
 
     // Step 1: stop accepting new connections
     // Existing in-flight requests are allowed to complete.
     server.close(async (): Promise<void> => {
-      log.info('HTTP server closed');
+      log.info('server.http_closed');
 
       // Step 2: disconnect Redis
       try {
         await disconnectRedis();
-        log.info('Redis disconnected');
+        log.info('server.redis_disconnected');
       } catch {
-        log.warn('Redis disconnect error — forcing exit');
+        log.warn('server.redis_disconnect_failed');
       }
 
       // Step 3: stop telemetry — never throws
       await shutdownTelemetry();
-      log.info('Telemetry shut down');
+      log.info('server.telemetry_shutdown');
 
       // Step 4: exit cleanly
       process.exit(0);
@@ -95,7 +100,7 @@ async function start(): Promise<void> {
     // Safety timeout — if server.close() doesn't complete within 10s,
     // force exit to avoid hanging indefinitely in a broken state.
     setTimeout((): void => {
-      log.error('Graceful shutdown timed out — forcing exit');
+      log.error('server.shutdown_timeout');
       process.exit(1);
     }, 10_000).unref(); // unref() so the timeout doesn't keep the event loop alive
   }
