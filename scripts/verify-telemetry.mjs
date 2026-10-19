@@ -36,7 +36,7 @@
 import { spawn, spawnSync } from 'node:child_process';
 import http from 'node:http';
 import net from 'node:net';
-import { randomBytes } from 'node:crypto';
+import { createHmac, randomBytes, randomUUID } from 'node:crypto';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { setTimeout as sleep } from 'node:timers/promises';
 import dotenv from 'dotenv';
@@ -98,14 +98,62 @@ function startOtlpTrap() {
 }
 
 // ── Stub gateway ────────────────────────────────────────────────────────────
-// Razorpay's healthCheck() counts any HTTP response as healthy. Answering 200
-// also keeps error_type off the http.client histogram, so its label keys are
-// the same on every machine.
+// Just enough of the Razorpay API for the business flow below: create an
+// order, create a refund, and 200 for anything else (healthCheck() counts any
+// response as healthy). Always 200, which also keeps error_type off the
+// http.client histogram, so its label keys are the same on every machine.
+
+// Fresh IDs per created order: Redis outlives a run, and a reused gateway ID
+// would make the signed webhook resolve to the previous run's payment.
+const stub = { orderId: '', paymentId: '' };
+
+function readJson(req) {
+  return new Promise((resolve) => {
+    let body = '';
+    req.on('data', (chunk) => (body += chunk));
+    req.on('end', () => {
+      try {
+        resolve(JSON.parse(body || '{}'));
+      } catch {
+        resolve({});
+      }
+    });
+  });
+}
 
 function startStubGateway() {
-  const server = http.createServer((req, res) => {
-    req.resume();
-    res.writeHead(200, { 'content-type': 'application/json' }).end('{"items":[]}');
+  const server = http.createServer(async (req, res) => {
+    const body = await readJson(req);
+    const now = Math.floor(Date.now() / 1000);
+    let reply = { items: [] };
+    if (req.method === 'POST' && req.url === '/orders') {
+      const suffix = randomBytes(7).toString('hex');
+      stub.orderId = `order_${suffix}`;
+      stub.paymentId = `pay_${suffix}`;
+      reply = {
+        id: stub.orderId,
+        entity: 'order',
+        amount: body.amount,
+        amount_paid: 0,
+        amount_due: body.amount,
+        currency: body.currency ?? 'INR',
+        receipt: body.receipt,
+        status: 'created',
+        attempts: 0,
+        created_at: now,
+      };
+    } else if (req.method === 'POST' && /^\/payments\/[^/]+\/refunds$/.test(req.url ?? '')) {
+      reply = {
+        id: 'rfnd_verify0000001',
+        entity: 'refund',
+        amount: body.amount,
+        currency: 'INR',
+        payment_id: stub.paymentId,
+        status: 'processed',
+        created_at: now,
+      };
+    }
+    res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(reply));
   });
   return new Promise((resolve, reject) => {
     server.once('error', (err) => {
@@ -133,8 +181,9 @@ function childEnv(nodeEnv) {
     METRICS_PORT: String(METRICS_PORT),
     METRICS_AUTH_TOKEN: TOKEN,
     REDIS_URL: env.REDIS_URL ?? 'redis://localhost:6379',
-    // Never called during the run; only has to pass config validation.
-    WEBHOOK_RELAY_URL: env.WEBHOOK_RELAY_URL ?? 'http://127.0.0.1:9/relay',
+    // Always local: the business flow relays a webhook, and the run must not
+    // reach a real merchant endpoint. Port 9 refuses → relay network_error.
+    WEBHOOK_RELAY_URL: 'http://127.0.0.1:9/relay',
     ACTIVE_GATEWAY: 'razorpay',
     RAZORPAY_BASE_URL: `http://127.0.0.1:${GATEWAY_PORT}`,
     RAZORPAY_KEY_ID: 'rzp_test_verify',
@@ -345,6 +394,142 @@ function checkHttpHistogram(body) {
   return failures;
 }
 
+// ── Business flow ───────────────────────────────────────────────────────────
+// Instruments appear in /metrics only once they have recorded, so drive one
+// pass through the main paths — otherwise the snapshot would pin almost none
+// of the catalogue (ADR 003 §6). Against the stub gateway, with the webhook
+// secret from childEnv, so the signed webhook verifies.
+
+const API = `http://127.0.0.1:${PORT}`;
+const WEBHOOK_SECRET = 'verify';
+
+async function call(method, path, { body, headers = {} } = {}) {
+  const res = await fetch(`${API}${path}`, {
+    method,
+    headers: { 'content-type': 'application/json', ...headers },
+    ...(body !== undefined && { body }),
+    signal: AbortSignal.timeout(10_000),
+  });
+  return { status: res.status, json: await res.json().catch(() => ({})) };
+}
+
+function expectStatus(step, { status }, expected) {
+  if (status !== expected) throw new Error(`${step} answered ${status}, expected ${expected}`);
+}
+
+async function driveBusinessFlow() {
+  const orderId = `VERIFY-${randomBytes(6).toString('hex')}`;
+  const payment = JSON.stringify({ amount: 50000, currency: 'INR', orderId });
+  const idempotency = { 'idempotency-key': randomUUID() };
+
+  // payments.created, idempotency.decisions{miss}, gateway.*{createPayment}
+  const created = await call('POST', '/payments', { body: payment, headers: idempotency });
+  expectStatus('POST /payments', created, 201);
+  const chkId = created.json?.data?.paymentId;
+
+  // idempotency.decisions{hit}
+  expectStatus(
+    'POST /payments (replay)',
+    await call('POST', '/payments', { body: payment, headers: idempotency }),
+    201,
+  );
+
+  // webhook.signature_failures, webhook.received{rejected}
+  await call('POST', '/webhooks/razorpay', {
+    body: '{}',
+    headers: { 'x-razorpay-signature': '00'.repeat(32) },
+  });
+
+  // orderid.reservation_conflicts{deduplicated} — same orderId, new key
+  expectStatus(
+    'POST /payments (same orderId)',
+    await call('POST', '/payments', {
+      body: payment,
+      headers: { 'idempotency-key': randomUUID() },
+    }),
+    201,
+  );
+
+  // webhook.received{updated}, payment.transitions{webhook}, relay.* —
+  // the relay goes to WEBHOOK_RELAY_URL (port 9, refused → network_error)
+  expectStatus('POST /webhooks/razorpay', await sendCaptured(stub.orderId, stub.paymentId), 200);
+
+  // refunds{created}, refund.amount_minor, payment.transitions{refund}
+  expectStatus(
+    'POST /payments/:chkId/refund',
+    await call('POST', `/payments/${chkId}/refund`, { body: JSON.stringify({ amount: 10000 }) }),
+    201,
+  );
+
+  // payment.transitions_blocked — captured again on a PARTIALLY_REFUNDED payment
+  expectStatus(
+    'POST /webhooks/razorpay (replay)',
+    await sendCaptured(stub.orderId, stub.paymentId),
+    200,
+  );
+
+  // webhook.unknown_payment — signed, but for IDs no payment has
+  expectStatus(
+    'POST /webhooks/razorpay (unknown)',
+    await sendCaptured('order_unknown0000000', 'pay_unknown00000000'),
+    200,
+  );
+}
+
+function sendCaptured(orderId, paymentId) {
+  const captured = JSON.stringify({
+    entity: 'event',
+    account_id: 'acc_verify',
+    event: 'payment.captured',
+    contains: ['payment'],
+    payload: {
+      payment: {
+        entity: {
+          id: paymentId,
+          entity: 'payment',
+          amount: 50000,
+          currency: 'INR',
+          status: 'captured',
+          order_id: orderId,
+          created_at: Math.floor(Date.now() / 1000),
+        },
+      },
+    },
+    created_at: Math.floor(Date.now() / 1000),
+  });
+  const signature = createHmac('sha256', WEBHOOK_SECRET).update(captured).digest('hex');
+  return call('POST', '/webhooks/razorpay', {
+    body: captured,
+    headers: { 'x-razorpay-signature': signature },
+  });
+}
+
+// Families the flow above must produce. Prefix/suffix-agnostic: exact names
+// are the snapshot's job.
+const BUSINESS_FAMILIES = [
+  'gateway_request_duration',
+  'gateway_requests_total',
+  'payments_created_total',
+  'payment_transitions_total',
+  'payment_transitions_blocked_total',
+  'webhook_unknown_payment_total',
+  'orderid_reservation_conflicts_total',
+  'webhook_received_total',
+  'webhook_signature_failures_total',
+  'webhook_processing_duration',
+  'webhook_relay_attempts_total',
+  'webhook_relay_duration',
+  'idempotency_decisions_total',
+  'refunds_total',
+  'refund_amount_minor_total',
+];
+
+function checkBusinessFamilies(body) {
+  return BUSINESS_FAMILIES.filter(
+    (family) => !new RegExp(`^# TYPE \\w*${family} `, 'm').test(body),
+  ).map((family) => `business metric ${family} missing after the business flow`);
+}
+
 async function verifyTarget(target, trap) {
   const failures = [];
   let shape;
@@ -354,6 +539,9 @@ async function verifyTarget(target, trap) {
   try {
     const healthStatus = await waitForHealth(proc);
     console.log(`  /health answered ${healthStatus}`);
+
+    await driveBusinessFlow();
+    console.log('  business flow: payment, replay, dedup, webhooks, refund');
 
     const anonymous = await scrape(undefined);
     if (anonymous.status !== 401) {
@@ -374,6 +562,7 @@ async function verifyTarget(target, trap) {
       failures.push('checkoutos_build_info missing — instruments not reaching the exposition');
     }
     failures.push(...checkHttpHistogram(body));
+    failures.push(...checkBusinessFamilies(body));
     shape = expositionShape(body);
   } catch (err) {
     failures.push(err.message);
