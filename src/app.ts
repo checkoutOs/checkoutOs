@@ -16,13 +16,14 @@
 //   webhookRouter       ← handles POST /webhooks/:gateway
 //   express.json()      ← runs after, applies to all other routes
 
-import express, { Application, Request, Response, NextFunction } from 'express';
+import express, { Application } from 'express';
 import { registerGateways } from './gateways/gateway.registry';
 import { connectRedis } from './store/redis.client';
 import { config } from './config';
 import type { SupportedGatewayName } from './gateways/gateway.registry';
 import { errorHandler } from './middleware/error.middleware';
 import { notFoundHandler } from './middleware/not-found.middleware';
+import { requestLogger } from './middleware/request-logger';
 import { createContextLogger } from './utils/logger';
 import { checkoutRouter } from './routes/checkout.routes';
 import { healthRouter, refundRouter, paymentRouter, webhookRouter } from './routes';
@@ -38,44 +39,7 @@ export function buildApp(): Application {
 
   // ── 1. Request logger ────────────────────────────────────────────────────
   // Must be first — captures all requests including those that fail early.
-  // Log level follows HTTP status: 5xx → error, 4xx → warn, 2xx/3xx → info.
-  app.use((req: Request, res: Response, next: NextFunction): void => {
-    const start = Date.now();
-
-    let route: string | undefined;
-    let current: unknown;
-    Object.defineProperty(req, 'route', {
-      configurable: true,
-      enumerable: true,
-      get: (): unknown => current,
-      set: (value: unknown): void => {
-        current = value;
-        const pattern = (value as { path?: unknown } | undefined)?.path;
-        if (typeof pattern === 'string') {
-          route = `${req.baseUrl}${pattern}`.replace(/(.)\/$/, '$1');
-        }
-      },
-    });
-
-    res.on('finish', (): void => {
-      const latencyMs = Date.now() - start;
-      const level = res.statusCode >= 500 ? 'error' : res.statusCode >= 400 ? 'warn' : 'info';
-
-      // By 'finish', a mounted router has rewritten req.path ('/health' → '/'),
-      // so the real path comes from originalUrl (query string dropped).
-      const path = req.originalUrl.split('?')[0];
-
-      log[level]('http.request.completed', {
-        method: req.method,
-        path,
-        ...(route !== undefined && { route }),
-        statusCode: res.statusCode,
-        latencyMs,
-      });
-    });
-
-    next();
-  });
+  app.use(requestLogger);
 
   // ── 2. Gateway-specific webhook body parsers — BEFORE express.json() ─────
   // Each gateway requires a different body format for webhook verification:
