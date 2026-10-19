@@ -7,7 +7,7 @@ description: checkoutOs is a redirect-based, SDK-less HTTP API payment orchestra
 You are an expert contributor for checkoutOs.
 
 Before writing code, always consult the project documentation:
-- `docs/adr/` — Architecture Decision Records (001 idempotency, 002 Paytm integration, 003 observability plan — *Proposed*; Phase 0 implemented: `src/telemetry/`, `/metrics` on :9464; logs/metrics phases pending).
+- `docs/adr/` — Architecture Decision Records (001 idempotency, 002 Paytm integration, 003 observability plan — *Proposed*; Phases 0, 1a, 1b implemented: `src/telemetry/`, `/metrics` on :9464, structured event logs, `observability/` Loki stack; metrics phases pending).
 - `projectSpec/` — architecture spec (`v1oArchitectureDesign.md`), contributor guide (`contributorguide.md`), build steps (`Steps.md`), gateway guide (`GatewayIntegrationGuide.md` — currently a duplicate of `Steps.md`), plus PDF handbooks.
 - `idempotency.md` (repo root) — full idempotency implementation plan.
 - `openapi.yaml` — public API contract. Update it when you change request/response shapes.
@@ -87,7 +87,7 @@ Middleware
 - Fail fast
 - Never silently ignore unknown gateway states
 - Unknown status -> GatewayMappingError
-- Only `src/config/env.schema.ts` and `src/config/index.ts` may read `process.env` (exceptions today: `server.ts` debug log, `app.ts` passes `process.env` into `registerGateways`, and `src/config/runtime.ts` — the telemetry bootstrap's early read, which has **no imports** and is imported **only** by `src/telemetry/`; enforced by `tests/unit/config/runtime.test.ts`)
+- Only `src/config/env.schema.ts` and `src/config/index.ts` may read `process.env` (exceptions today: `app.ts` passes `process.env` into `registerGateways`, and `src/config/runtime.ts` — the telemetry bootstrap's early read, which has **no imports** and is imported **only** by `src/telemetry/`; enforced by `tests/unit/config/runtime.test.ts`)
 - No module cycles — check with `npm run lint:circular`
 
 ---
@@ -131,6 +131,7 @@ docker run -d --name checkoutos-redis -p 6379:6379 redis:7-alpine
 npm run mock:gateway    # MSW mock Razorpay + Paytm on :9090
 npm run dev             # tsx watch on :3000, /metrics on :9464
 ```
+Logs in Grafana/Loki: `docker compose --profile observability up -d --build` → `http://localhost:3001` (see Docker).
 To hit the mock instead of real gateways, set `RAZORPAY_BASE_URL=http://localhost:9090` (or `PAYTM_BASE_URL=http://localhost:9090`) in `.env`.
 
 ## Commands
@@ -287,11 +288,14 @@ There is no `lint` script — run `npx eslint .` directly.
 - Port 9464 (`/metrics`) is `EXPOSE`d for documentation only and is **not** published by compose — scrape it on the compose network as `checkoutos:9464`.
 - `docker compose up` starts app + Redis. Compose overrides `REDIS_URL` to `redis://redis:6379`.
 - `docker compose --profile mock up` — **will fail**: references `Dockerfile.mock` which does not exist.
+- `docker compose --profile observability up -d --build` adds Loki + Alloy + Grafana (`observability/`, pulled in by `include:` in the root compose file). Grafana: `http://localhost:3001` (127.0.0.1 only, anonymous admin — local use only). Loki/Alloy are not published. Query one request with `{service="checkoutos"} | trace_id="<id>"`.
+  - Pipeline: app stdout JSON → Docker `json-file` (rotated: `max-size 10m`, `max-file 5`) → Alloy (`loki.source.docker`, Docker socket, filters on `com.docker.compose.service=checkoutos`) → Loki 3 (tsdb/v13, 7-day retention).
+  - Loki **labels** (bounded): `service`, `env`, `level`, `component`, `compose_service`. **Structured metadata**: `trace_id`, `span_id`, `event`. Never promote IDs to labels.
+  - `trace_id` is present on every line logged inside a request; startup/shutdown lines have none (no active span).
+  - Any non-JSON stdout lands as an unparsed line — the only intentional ones are `config/index.ts`'s config-error banner and `server.ts`'s `Fatal startup error`. Never add `console.*` elsewhere in `src/`.
 - `docker/Dockerfile` and `docker/docker-compose.yml` are empty stubs.
 
 ## Known issues / gotchas
-- `src/server.ts` has a `console.log('ENV DEBUG:', ...)` that logs `ACTIVE_GATEWAY`, `REDIS_URL`, `WEBHOOK_RELAY_URL` on every startup — an info leak in production.
-- `src/gateways/razorpay/razorpay.plugin.ts` uses `console.error` / `console.log` in `extractRazorpayErrorReason()` and `createRefund()` instead of the logger.
 - `src/controllers/checkout.controller.ts` imports `getActiveGateway()` directly — a violation of the "controllers have no gateway access" rule. Prefer moving it into `checkout.service.ts` when touching that code.
 - `src/services/health.service.ts` imports `pingRedis` straight from `store/redis.client.ts`, although that file says services must not import it directly.
 - `vitest.setup.integration.ts` commits Razorpay test-mode credentials and points integration tests at the real sandbox (see Testing).
