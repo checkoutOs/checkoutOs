@@ -1,0 +1,86 @@
+// observability/alloy/config.alloy
+// checkoutos container stdout → Loki.
+//
+// Labels are the stream index, so they must stay bounded (ADR 003 §8):
+//   service, env, level, component, compose_service
+// Per-request values go in structured metadata — queryable without `| json`
+// and without creating a stream per value:
+//   trace_id, span_id, event
+// chkId, orderId, gateway IDs stay in the log body. Never promote them.
+
+// ── Discover only the checkoutos API container ──────────────────────────────
+discovery.docker "checkoutos" {
+  host             = "unix:///var/run/docker.sock"
+  refresh_interval = "5s"
+
+  filter {
+    name   = "label"
+    values = ["com.docker.compose.service=checkoutos"]
+  }
+}
+
+// Fallback label for lines that are not JSON (e.g. the config-error banner
+// from config/index.ts, or a crash): they still land in a findable stream.
+discovery.relabel "checkoutos" {
+  targets = discovery.docker.checkoutos.targets
+
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+    target_label  = "compose_service"
+  }
+}
+
+loki.source.docker "checkoutos" {
+  host             = "unix:///var/run/docker.sock"
+  targets          = discovery.relabel.checkoutos.output
+  relabel_rules    = discovery.relabel.checkoutos.rules
+  refresh_interval = "5s"
+  forward_to       = [loki.process.checkoutos.receiver]
+}
+
+// ── Parse the winston JSON record ───────────────────────────────────────────
+loki.process "checkoutos" {
+  stage.json {
+    expressions = {
+      service   = "",
+      env       = "",
+      level     = "",
+      component = "",
+      event     = "",
+      trace_id  = "",
+      span_id   = "",
+      timestamp = "",
+    }
+  }
+
+  stage.labels {
+    values = {
+      service   = "",
+      env       = "",
+      level     = "",
+      component = "",
+    }
+  }
+
+  stage.structured_metadata {
+    values = {
+      trace_id = "",
+      span_id  = "",
+      event    = "",
+    }
+  }
+
+  // The record's own time, not the moment Alloy read it.
+  stage.timestamp {
+    source = "timestamp"
+    format = "RFC3339"
+  }
+
+  forward_to = [loki.write.local.receiver]
+}
+
+loki.write "local" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+  }
+}

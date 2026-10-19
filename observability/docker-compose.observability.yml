@@ -1,0 +1,99 @@
+# observability/docker-compose.observability.yml
+# Log pipeline for checkoutOs (ADR 003 §5 Phase 1, §10):
+#
+#   checkoutos stdout (JSON) → Docker json-file → Alloy → Loki → Grafana
+#
+# Included from the root docker-compose.yml. Every service here is behind the
+# `observability` profile, so a plain `docker compose up` is unchanged:
+#
+#   docker compose --profile observability up -d --build
+#   open http://localhost:3001  → Explore → Loki
+#     {service="checkoutos"}
+#     {service="checkoutos"} | trace_id="<id>"     ← every line of one request
+#
+# Only Grafana is published, and only on 127.0.0.1: it runs with anonymous
+# admin access for local use. Loki and Alloy stay on the compose network.
+# Never run this file as-is on a shared host.
+
+services:
+  # ── Loki — log store ───────────────────────────────────────────────────────
+  loki:
+    image: grafana/loki:3.5.0
+    container_name: checkoutos-loki
+    restart: unless-stopped
+    command: ['-config.file=/etc/loki/loki-config.yml']
+    volumes:
+      - ./loki/loki-config.yml:/etc/loki/loki-config.yml:ro
+      - loki_data:/loki
+    healthcheck:
+      test: ['CMD-SHELL', 'wget -qO- http://localhost:3100/ready | grep -q ready']
+      interval: 10s
+      timeout: 5s
+      start_period: 20s
+      retries: 10
+    networks:
+      - observability
+    profiles:
+      - observability
+
+  # ── Alloy — tails container stdout, ships to Loki ──────────────────────────
+  # Reads logs through the Docker API, so it needs the socket (read-only).
+  # Promtail is deprecated — do not replace this with it (ADR 003 §5 Phase 1c).
+  alloy:
+    image: grafana/alloy:v1.10.0
+    container_name: checkoutos-alloy
+    restart: unless-stopped
+    command:
+      - run
+      - --server.http.listen-addr=0.0.0.0:12345
+      - --storage.path=/var/lib/alloy/data
+      - /etc/alloy/config.alloy
+    volumes:
+      - ./alloy/config.alloy:/etc/alloy/config.alloy:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      # Read positions survive restarts, so lines are not re-shipped.
+      - alloy_data:/var/lib/alloy/data
+    depends_on:
+      loki:
+        condition: service_healthy
+    networks:
+      - observability
+    profiles:
+      - observability
+
+  # ── Grafana — query UI ─────────────────────────────────────────────────────
+  # Port 3001: 3000 is the checkoutOs API.
+  grafana:
+    image: grafana/grafana:12.1.0
+    container_name: checkoutos-grafana
+    restart: unless-stopped
+    ports:
+      - '127.0.0.1:3001:3000'
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: 'true'
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: 'true'
+      GF_ANALYTICS_REPORTING_ENABLED: 'false'
+      GF_ANALYTICS_CHECK_FOR_UPDATES: 'false'
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      loki:
+        condition: service_healthy
+    networks:
+      - observability
+    profiles:
+      - observability
+
+volumes:
+  loki_data:
+  alloy_data:
+  grafana_data:
+
+# Separate from checkoutos-network: Alloy collects through the Docker socket,
+# not over the network, so nothing here needs to reach the app. (Prometheus
+# scraping checkoutos:9464 in Phase 2 will join checkoutos-network.)
+networks:
+  observability:
+    driver: bridge
