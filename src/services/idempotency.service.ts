@@ -13,6 +13,8 @@
 import * as IdempotencyStore from '../store/idempotency.store';
 import { IdempotencyKeyReusedError } from '../errors/idempotency.errors';
 import { createContextLogger } from '../utils/logger';
+import { telemetry } from '../telemetry/metrics';
+import { idempotencyLabels, type IdempotencyResult } from '../telemetry/attributes';
 import { now } from '../utils/time';
 import {
   IDEMPOTENCY_MAX_RETRIES,
@@ -78,6 +80,7 @@ export async function checkIdempotency(
       const created = await IdempotencyStore.setIdempotencyRecordIfNotExists(key, record);
       if (created) {
         log.info('idempotency.miss', { key, requestHash });
+        recordDecision('miss');
         return { type: 'MISS' };
       }
 
@@ -95,12 +98,14 @@ export async function checkIdempotency(
         existingHash: existing.requestHash,
         newHash: requestHash,
       });
+      recordDecision('hash_mismatch');
       throw new IdempotencyKeyReusedError(key);
     }
 
     // Case 3: Completed record — return cached response.
     if (existing.status === 'COMPLETED') {
       log.debug('idempotency.hit', { key });
+      recordDecision('hit');
       return { type: 'HIT', response: existing.response as unknown };
     }
 
@@ -118,6 +123,7 @@ export async function checkIdempotency(
       const overwritten = await IdempotencyStore.forceUpdateIfInProgress(key, newRecord);
       if (overwritten) {
         log.info('idempotency.stale_overwritten', { key });
+        recordDecision('stale_recovered');
         return { type: 'MISS' };
       }
 
@@ -129,13 +135,20 @@ export async function checkIdempotency(
 
     // Case 5: Fresh IN_PROGRESS — another request is processing.
     log.debug('idempotency.in_progress', { key, updatedAt: existing.updatedAt });
+    recordDecision('in_progress');
     return { type: 'IN_PROGRESS' };
   }
 
   // Retries exhausted — return IN_PROGRESS so the caller surfaces a 409.
   // The client may retry after the stale timeout window (30s) for auto-recovery.
   log.error('idempotency.race_condition_retry_exhausted', { key });
+  recordDecision('in_progress');
   return { type: 'IN_PROGRESS' };
+}
+
+// idempotency.decisions {result} — one per checkIdempotency() outcome (ADR 003 §6.4).
+function recordDecision(result: IdempotencyResult): void {
+  telemetry().idempotencyDecisions.add(1, idempotencyLabels(result));
 }
 
 // Release a claim taken by checkIdempotency() when the request that took it

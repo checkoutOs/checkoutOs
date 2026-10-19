@@ -24,6 +24,15 @@ import {
 } from '../store/payment.store';
 import { createContextLogger } from '../utils/logger';
 import { config } from '../config';
+import { secondsSince, telemetry } from '../telemetry/metrics';
+import {
+  relayLabels,
+  transitionLabels,
+  webhookLabels,
+  webhookReceivedLabels,
+  type RelayOutcome,
+  type WebhookResult,
+} from '../telemetry/attributes';
 import type { GatewayName } from '../types/payment.types';
 import type { WebhookEvent } from '../types/gateway.types';
 
@@ -67,18 +76,68 @@ function isValidTransition(from: string, to: string): boolean {
   return allowed.includes(to);
 }
 
-// webhook.service.ts - Fixed processWebhook function
+// processWebhook
+//
+// Metrics (ADR 003 §6.3): webhook.received {gateway, event, result} for every
+// delivery, and webhook.processing.duration around parse + state machine.
+// Processing time stops BEFORE the relay: relay latency is the merchant's and
+// has its own histogram — nesting it would bury the Redis-bound timings.
 
 export async function processWebhook(
   gateway: GatewayName,
   body: unknown,
   headers: Record<string, string | string[] | undefined>,
 ): Promise<void> {
-  const plugin = getActiveGateway();
+  const start = process.hrtime.bigint();
 
-  // Parse and verify signature
-  const event = plugin.parseWebhookEvent(body, headers);
+  // Parse and verify signature (signature failures are also counted by the
+  // gateway decorator, as webhook.signature_failures)
+  let event: WebhookEvent;
+  try {
+    event = getActiveGateway().parseWebhookEvent(body, headers);
+  } catch (err) {
+    recordWebhook(gateway, undefined, 'rejected', start);
+    throw err;
+  }
 
+  let applied: AppliedWebhook;
+  try {
+    applied = await applyWebhook(gateway, body, event);
+  } catch (err) {
+    recordWebhook(gateway, event.event, 'error', start);
+    throw err;
+  }
+  recordWebhook(gateway, event.event, applied.result, start);
+
+  // Relay to developer — timed separately, in relayWebhook
+  if (applied.chkId !== undefined) {
+    await relayWebhook(applied.chkId, event);
+  }
+}
+
+function recordWebhook(
+  gateway: GatewayName,
+  gatewayEvent: string | undefined,
+  result: WebhookResult,
+  start: bigint,
+): void {
+  const m = telemetry();
+  m.webhookProcessingDuration.record(secondsSince(start), webhookLabels(gateway));
+  m.webhookReceived.add(1, webhookReceivedLabels(gateway, gatewayEvent, result));
+}
+
+interface AppliedWebhook {
+  result: WebhookResult;
+  // Set when the event should be relayed to the merchant.
+  chkId?: string;
+}
+
+// Reverse lookup + state machine. Everything up to, but not including, the relay.
+async function applyWebhook(
+  gateway: GatewayName,
+  body: unknown,
+  event: WebhookEvent,
+): Promise<AppliedWebhook> {
   log.info('webhook.received', {
     gateway,
     gatewayEvent: event.event,
@@ -146,7 +205,8 @@ export async function processWebhook(
       gatewayPaymentId: event.gatewayPaymentId,
       reason: 'no_chk_id_found',
     });
-    return;
+    telemetry().webhookUnknownPayment.add(1, webhookLabels(gateway));
+    return { result: 'unknown_payment' };
   }
 
   // Read stored payment
@@ -158,10 +218,11 @@ export async function processWebhook(
       gateway,
       gatewayPaymentId: event.gatewayPaymentId,
     });
-    return;
+    return { result: 'record_missing' };
   }
 
   let paymentUpdated = false;
+  let blocked = false;
 
   // Backfill gatewayPaymentId FIRST
   if (stored.gatewayPaymentId === '' && event.gatewayPaymentId !== '') {
@@ -186,11 +247,20 @@ export async function processWebhook(
         gatewayEvent: event.event,
         gatewayPaymentId: event.gatewayPaymentId,
       });
+      telemetry().paymentTransitionsBlocked.add(
+        1,
+        transitionLabels(gateway, stored.status, event.status, 'webhook'),
+      );
+      blocked = true;
       // Do NOT throw — return silently to prevent gateway retry storms.
       // Relay should still happen so the developer is aware of the event.
     } else {
       await updatePaymentStatus(chkId, event.status);
       paymentUpdated = true;
+      telemetry().paymentTransitions.add(
+        1,
+        transitionLabels(gateway, stored.status, event.status, 'webhook'),
+      );
 
       log.info('webhook.status_updated', {
         chkId,
@@ -210,8 +280,10 @@ export async function processWebhook(
     });
   }
 
-  // Relay to developer
-  await relayWebhook(chkId, event);
+  return {
+    result: blocked ? 'blocked' : paymentUpdated ? 'updated' : 'unchanged',
+    chkId,
+  };
 }
 
 // relayWebhook
@@ -225,6 +297,9 @@ async function relayWebhook(chkId: string, event: WebhookEvent): Promise<void> {
     paymentId: chkId,
     ...event,
   };
+
+  const start = process.hrtime.bigint();
+  let outcome: RelayOutcome = 'success';
 
   try {
     const response = await axios.post(relayUrl, payload, {
@@ -242,6 +317,7 @@ async function relayWebhook(chkId: string, event: WebhookEvent): Promise<void> {
     // or to populate a DLQ entry in V1.2.
     const statusCode = axios.isAxiosError(err) ? err.response?.status : undefined;
     const errorMessage = err instanceof Error ? err.message : String(err);
+    outcome = classifyRelayError(err);
 
     log.warn('webhook.relay_failed', {
       chkId,
@@ -253,5 +329,19 @@ async function relayWebhook(chkId: string, event: WebhookEvent): Promise<void> {
       gatewayEvent: event.event,
       gatewayPaymentId: event.gatewayPaymentId,
     });
+  } finally {
+    const m = telemetry();
+    m.webhookRelayDuration.record(secondsSince(start));
+    m.webhookRelayAttempts.add(1, relayLabels(outcome));
   }
+}
+
+// The merchant answered non-2xx → http_error; never answered within
+// RELAY_TIMEOUT_MS → timeout; anything else (DNS, refused, reset) → network_error.
+function classifyRelayError(err: unknown): RelayOutcome {
+  if (axios.isAxiosError(err)) {
+    if (err.response !== undefined) return 'http_error';
+    if (err.code === 'ECONNABORTED' || err.code === 'ETIMEDOUT') return 'timeout';
+  }
+  return 'network_error';
 }

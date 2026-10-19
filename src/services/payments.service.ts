@@ -43,6 +43,13 @@ import { ORDER_ID_MAX_LENGTH, ORDER_ID_PATTERN } from '../types/common.types';
 import { checkIdempotency, completeIdempotency, releaseIdempotency } from './idempotency.service';
 import { findPaymentByOrderId, reserveOrderId } from '../store/payment.store';
 import { IdempotencyRequestInProgressError } from '../errors';
+import { telemetry } from '../telemetry/metrics';
+import {
+  orderIdConflictLabels,
+  paymentCreatedLabels,
+  pollLabels,
+  transitionLabels,
+} from '../telemetry/attributes';
 
 const log = createContextLogger('payment-service');
 
@@ -174,6 +181,10 @@ export async function createPayment(
   };
 
   await savePayment(stored);
+  telemetry().paymentsCreated.add(
+    1,
+    paymentCreatedLabels(stored.gateway, stored.currency, stored.status),
+  );
   // create reverse lookup for gatewayOrderId for webhook to find the payment by orderId
 
   log.info('payment.created', {
@@ -329,6 +340,7 @@ export async function createPaymentWithIdempotency(
       // Nothing was created at the gateway on this path, so the idempotency
       // claim is provably safe to hand back before surfacing the 409.
       log.warn('orderid.creation_in_progress', { orderId: req.orderId });
+      telemetry().orderIdReservationConflicts.add(1, orderIdConflictLabels('in_progress'));
       await releaseClaim(idempotency, 'orderId.creation_in_progress');
       throw new OrderCreationInProgressError(req.orderId);
     }
@@ -339,6 +351,7 @@ export async function createPaymentWithIdempotency(
         existingAmount: existingByOrderId.amount,
         newAmount: req.amount,
       });
+      telemetry().orderIdReservationConflicts.add(1, orderIdConflictLabels('amount_mismatch'));
       await releaseClaim(idempotency, 'orderId.amount_mismatch');
       throw new OrderIdAmountMismatchError(req.orderId, existingByOrderId.amount, req.amount);
     }
@@ -350,6 +363,7 @@ export async function createPaymentWithIdempotency(
         existingCurrency: existingByOrderId.currency,
         newCurrency: req.currency,
       });
+      telemetry().orderIdReservationConflicts.add(1, orderIdConflictLabels('currency_mismatch'));
       await releaseClaim(idempotency, 'orderId.currency_mismatch');
       throw new OrderIdCurrencyMismatchError(req.orderId, existingByOrderId.currency, req.currency);
     }
@@ -359,6 +373,7 @@ export async function createPaymentWithIdempotency(
       orderId: req.orderId,
       chkId: existingByOrderId.chkId,
     });
+    telemetry().orderIdReservationConflicts.add(1, orderIdConflictLabels('deduplicated'));
 
     response = {
       paymentId: existingByOrderId.chkId,
@@ -473,6 +488,7 @@ export async function getPaymentStatus(chkId: string): Promise<PaymentStatusResp
       hasGatewayPaymentId: stored.gatewayPaymentId !== '',
       reason: 'SUCCESS requires webhook to populate gatewayPaymentId',
     });
+    telemetry().pollSuccessSuppressed.add(1, pollLabels(stored.gateway));
 
     // Return current Redis state (still PENDING/PROCESSING)
     // The webhook will handle the transition and backfill gatewayPaymentId
@@ -503,6 +519,10 @@ export async function getPaymentStatus(chkId: string): Promise<PaymentStatusResp
   if (fresh.status !== stored.status) {
     const oldStatus = stored.status;
     await updatePaymentStatus(chkId, fresh.status);
+    telemetry().paymentTransitions.add(
+      1,
+      transitionLabels(stored.gateway, oldStatus, fresh.status, 'poll'),
+    );
     stored.status = fresh.status;
     stored.updatedAt = now();
 
