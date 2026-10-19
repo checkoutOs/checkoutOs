@@ -42,13 +42,33 @@ export function buildApp(): Application {
   app.use((req: Request, res: Response, next: NextFunction): void => {
     const start = Date.now();
 
+    let route: string | undefined;
+    let current: unknown;
+    Object.defineProperty(req, 'route', {
+      configurable: true,
+      enumerable: true,
+      get: (): unknown => current,
+      set: (value: unknown): void => {
+        current = value;
+        const pattern = (value as { path?: unknown } | undefined)?.path;
+        if (typeof pattern === 'string') {
+          route = `${req.baseUrl}${pattern}`.replace(/(.)\/$/, '$1');
+        }
+      },
+    });
+
     res.on('finish', (): void => {
       const latencyMs = Date.now() - start;
       const level = res.statusCode >= 500 ? 'error' : res.statusCode >= 400 ? 'warn' : 'info';
 
-      log[level](`${req.method} ${req.path}`, {
+      // By 'finish', a mounted router has rewritten req.path ('/health' → '/'),
+      // so the real path comes from originalUrl (query string dropped).
+      const path = req.originalUrl.split('?')[0];
+
+      log[level]('http.request.completed', {
         method: req.method,
-        path: req.path,
+        path,
+        ...(route !== undefined && { route }),
         statusCode: res.statusCode,
         latencyMs,
       });
@@ -107,9 +127,9 @@ export async function initialise(): Promise<void> {
     config.gateway.active as SupportedGatewayName,
   );
 
-  log.info('Gateway registered', { gateway: config.gateway.active });
+  log.info('server.gateway_registered', { gateway: config.gateway.active });
 
   await connectRedis();
 
-  log.info('Redis connected');
+  log.info('server.redis_connected');
 }

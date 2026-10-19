@@ -27,27 +27,17 @@ process.env['RAZORPAY_BASE_URL'] = 'https://api.razorpay.com/v1';
 
 import { vi, beforeAll, afterAll, beforeEach } from 'vitest';
 import { connectRedis, disconnectRedis, redisClient } from './src/store/redis.client';
+import { configureLogger } from './src/utils/logger';
 
 // ---------------------------------------------------------------------------
 // Silence logger in integration tests too
 // ---------------------------------------------------------------------------
 
-vi.mock('./src/utils/logger', () => ({
-  logger: {
-    info: vi.fn(),
-    warn: vi.fn(),
-    error: vi.fn(),
-    debug: vi.fn(),
-  },
-  // Mirrors the real module surface — server.ts calls this at startup.
-  configureLogger: vi.fn(),
-  createContextLogger: () => ({
-    info: vi.fn(),
-    warn: vi.fn(),
-    error: vi.fn(),
-    debug: vi.fn(),
-  }),
-}));
+// The REAL logger runs in tests — no mock, so tests never drift from the
+// logger's actual shape. This setup file is the test composition root: like
+// server.ts in production, it hands the logger its settings. isTest sets
+// logger.silent. A test that needs output can call configureLogger() itself.
+configureLogger({ isTest: true, isDevelopment: false });
 
 // ---------------------------------------------------------------------------
 // Redis lifecycle
