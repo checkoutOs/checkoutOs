@@ -152,7 +152,8 @@ To hit the mock instead of real gateways, set `RAZORPAY_BASE_URL=http://localhos
 There is no `lint` script — run `npx eslint .` directly.
 
 ## Testing
-- **Unit tests** (`tests/unit/`): `ioredis` → `ioredis-mock` via `vi.mock()` in `vitest.setup.unit.ts`; logger silenced (the mock must expose `logger`, `configureLogger`, `createContextLogger`); no external services.
+- **Unit tests** (`tests/unit/`): `ioredis` → `ioredis-mock` via `vi.mock()` in `vitest.setup.unit.ts`; no external services.
+- **The logger is NOT mocked.** Both setup files call `configureLogger({ isTest: true, isDevelopment: false })` (the test composition root) → `logger.silent`. Never re-add a `vi.mock` of the logger. To assert on output, reconfigure and capture through a stream transport (see `tests/unit/utils/logger.test.ts`).
 - **Integration tests** (`tests/integration/`): Real Redis at `localhost:6379` required. `axios` is **not** mocked (the setup file's header comment saying otherwise is stale).
 - ⚠️ **Integration gateway target**: `vitest.config.ts` sets `RAZORPAY_BASE_URL=http://localhost:9090`, but `vitest.setup.integration.ts` **overrides** it at module load with `https://api.razorpay.com/v1` and hardcoded Razorpay *test-mode* credentials. Integration tests therefore hit the **real Razorpay sandbox**, not the mock server.
 - Integration test files run **serially** (`fileParallelism: false`); unit tests timeout 5 s, integration 15 s.
@@ -241,7 +242,16 @@ There is no `lint` script — run `npx eslint .` directly.
 ### Startup import cycle (fixed — don't reintroduce)
 `config/index.ts → env.schema.ts → gateway.registry.ts → paytm.plugin.ts → utils/logger.ts` used to loop back to `config`, causing a TDZ `ReferenceError` at startup. The logger now takes settings via `configureLogger()` from `server.ts` and defaults to production JSON at `info` level until then. Never import `config` from the logger or from anything the registry imports.
 
-`LoggerSettings` also carries optional `env`, `version` and `format`. Every record gets `service: 'checkoutos'` plus `env`/`version` via `defaultMeta`. The pretty format strips those base fields. `format` (from `LOG_FORMAT`) overrides the default of pretty in development, JSON otherwise. Each call re-applies everything, so an omitted field resets to its default. Extend these settings when the logger needs a new value — don't import `config` or `config/runtime.ts`.
+`LoggerSettings` also carries optional `service`, `env`, `version`, `format` and `isTTY`. Every record gets `service` (default `checkoutos`) plus `env`/`version` via `defaultMeta`. Format: `format` (from `LOG_FORMAT`) wins; otherwise pretty only when `isTTY` (passed by `server.ts` from `process.stdout.isTTY`), JSON everywhere else — including `NODE_ENV=development` off a terminal. Silencing is `logger.silent` (there is no `'silent'` level). Each call re-applies everything, so an omitted field resets to its default. Extend these settings when the logger needs a new value — don't import `config`, `config/runtime.ts` or `src/errors`, and make no ambient reads (`process.env`, `process.stdout`).
+
+### Logging conventions (ADR 003 §5 Phase 1a)
+- Call shape: `log.<level>('<event>', fields?)`, with `const log = createContextLogger('<component>')`. Records are `{ ...fields, event, component }`; `message` equals `event` (no `[context]` prefix).
+- Event names are **static**, dotted, lowercase, underscores within segments: `payment.created`, `webhook.relay_failed`, `http.error.operational`. Namespaces: `payment.` `refund.` `webhook.` `gateway.` `idempotency.` `orderid.` `redis.` `server.` `health.` `http.`. Dynamic values go in fields (`server.shutdown_started`, `{ signal }`). Enforced by `no-restricted-syntax` (`LOG_EVENT_PATTERN` in `eslint.config.js`, pinned by `tests/unit/lint/log-events.test.ts`).
+- Reserved field keys — `message`, `event`, `component`, `level` — are a **compile error** (`LogFields`). winston concatenates a meta `message` onto the record message. Use `errorMessage`, `gatewayEvent`, etc.
+- `Error`s in fields are expanded (name, message, stack, and AppError `code`/`details`) — pass the Error itself, not `err.message`, when the stack matters.
+- `http.request.completed` (app.ts) logs `path` (from `originalUrl`, no query string) and `route` (the bounded pattern, e.g. `/payments/:chkId`, captured when Express assigns `req.route` — it is wrong if read at `finish`).
+- Never put `chkId`, `orderId`, gateway IDs or customer data in a Loki **label**; they belong in the log body.
+- `scripts/event-map.json` records every pre-migration name → new name (use it to migrate saved Loki queries). `node scripts/log-events.mjs check` lists any non-conforming call site.
 
 ## Linting & formatting
 - All `**/*.ts`: `no-floating-promises: error`, `no-unused-vars` (args prefixed `_` ignored). Uses `typescript-eslint` recommended + strict.
@@ -252,6 +262,7 @@ There is no `lint` script — run `npx eslint .` directly.
 - Prettier: single quotes, semicolons, trailing commas, 100 print width.
 - `dist/` and `coverage/` are ignored. `scripts/**/*.mjs` and `src/**/*.mjs` get Node globals.
 - `import/no-restricted-paths` guards the telemetry boundaries (see Architecture Rules → Telemetry).
+- `no-restricted-syntax` on `src/**/*.ts`: the first argument of any `log.*(...)` / `log[level](...)` call must be a string literal matching `LOG_EVENT_PATTERN` (see Logging conventions).
 - Pre-commit: husky runs `npx lint-staged` (`eslint --fix && prettier --write` on staged `*.{ts,js}`). Hooks install via the `prepare` script.
 
 ## Env config

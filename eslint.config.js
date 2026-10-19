@@ -2,6 +2,18 @@ import js from '@eslint/js';
 import tseslint from 'typescript-eslint';
 import importPlugin from 'eslint-plugin-import';
 
+/**
+ * Log event names (ADR 003 §5 Phase 1a): dotted, lowercase, underscores allowed
+ * within a segment, at least one dot — payment.created, webhook.relay_failed,
+ * http.error.operational. Exported so tests/unit/lint/log-events.test.ts can
+ * validate it against every event name in the codebase. Keep in sync with
+ * PATTERN in scripts/log-events.mjs (the test checks that too).
+ */
+export const LOG_EVENT_PATTERN = /^[a-z][a-z0-9]*(_[a-z0-9]+)*(\.[a-z][a-z0-9]*(_[a-z0-9]+)*)+$/;
+
+// Context loggers are always bound to `log` (const log = createContextLogger(...)).
+const LOG_CALL = "CallExpression[callee.type='MemberExpression'][callee.object.name='log']";
+
 export default [
   {
     ignores: ['dist/**', 'coverage/**'],
@@ -62,6 +74,20 @@ export default [
       ],
 
       'import/no-default-export': 'error',
+
+      'no-restricted-syntax': [
+        'error',
+        {
+          selector: `${LOG_CALL} > :first-child:not(Literal)`,
+          message:
+            'Log event names must be static string literals (move dynamic values into fields) — see ADR 003 §5 Phase 1a',
+        },
+        {
+          selector: `${LOG_CALL} > Literal:first-child:not([value=/${LOG_EVENT_PATTERN.source}/])`,
+          message:
+            'Log event must be dotted lowercase, e.g. payment.created or webhook.relay_failed — see ADR 003 §5 Phase 1a',
+        },
+      ],
     },
   },
 
