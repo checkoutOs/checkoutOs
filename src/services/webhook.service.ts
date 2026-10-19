@@ -61,7 +61,7 @@ const VALID_TRANSITIONS: Record<string, string[]> = {
 function isValidTransition(from: string, to: string): boolean {
   const allowed = VALID_TRANSITIONS[from];
   if (!allowed) {
-    log.error('Unknown status in transition check', { from, to });
+    log.error('webhook.unknown_status', { from, to });
     return false;
   }
   return allowed.includes(to);
@@ -79,9 +79,9 @@ export async function processWebhook(
   // Parse and verify signature
   const event = plugin.parseWebhookEvent(body, headers);
 
-  log.info('Webhook received', {
+  log.info('webhook.received', {
     gateway,
-    event: event.event,
+    gatewayEvent: event.event,
     gatewayPaymentId: event.gatewayPaymentId,
     status: event.status,
   });
@@ -99,7 +99,7 @@ export async function processWebhook(
       chkId = await findChkIdByGatewayId(gateway, event.gatewayOrderId);
 
       if (chkId) {
-        log.info('Found payment via gatewayOrderId fallback', {
+        log.info('webhook.lookup_gateway_order_id_fallback', {
           gatewayOrderId: event.gatewayOrderId,
           chkId,
           gatewayPaymentId: event.gatewayPaymentId,
@@ -128,7 +128,7 @@ export async function processWebhook(
         chkId = await findChkIdByGatewayId(gateway, orderId);
 
         if (chkId) {
-          log.info('Found payment via order_id fallback', {
+          log.info('webhook.lookup_order_id_fallback', {
             orderId,
             chkId,
             gatewayPaymentId: event.gatewayPaymentId,
@@ -140,9 +140,9 @@ export async function processWebhook(
 
   // If still not found, log warning and return
   if (chkId === null) {
-    log.warn('Webhook received for unknown payment', {
+    log.warn('webhook.unknown_payment', {
       gateway,
-      event: event.event,
+      gatewayEvent: event.event,
       gatewayPaymentId: event.gatewayPaymentId,
       reason: 'no_chk_id_found',
     });
@@ -153,7 +153,7 @@ export async function processWebhook(
   const stored = await findPaymentByChkId(chkId);
 
   if (stored === null) {
-    log.error('Reverse lookup found chkId but payment record missing', {
+    log.error('webhook.payment_record_missing', {
       chkId,
       gateway,
       gatewayPaymentId: event.gatewayPaymentId,
@@ -168,7 +168,7 @@ export async function processWebhook(
     await updateGatewayPaymentId(chkId, gateway, event.gatewayPaymentId);
     paymentUpdated = true;
 
-    log.info('Gateway payment ID set from webhook', {
+    log.info('webhook.gateway_payment_id_set', {
       chkId,
       gatewayPaymentId: event.gatewayPaymentId,
       existingStatus: stored.status,
@@ -178,12 +178,12 @@ export async function processWebhook(
   // Update status if different
   if (event.status !== stored.status) {
     if (!isValidTransition(stored.status, event.status)) {
-      log.warn('Invalid status transition blocked by state machine guard', {
+      log.warn('webhook.transition_blocked', {
         chkId,
         gateway,
         currentStatus: stored.status,
         attemptedStatus: event.status,
-        event: event.event,
+        gatewayEvent: event.event,
         gatewayPaymentId: event.gatewayPaymentId,
       });
       // Do NOT throw — return silently to prevent gateway retry storms.
@@ -192,21 +192,21 @@ export async function processWebhook(
       await updatePaymentStatus(chkId, event.status);
       paymentUpdated = true;
 
-      log.info('Payment status updated from webhook', {
+      log.info('webhook.status_updated', {
         chkId,
         oldStatus: stored.status,
         newStatus: event.status,
-        event: event.event,
+        gatewayEvent: event.event,
       });
     }
   }
 
   if (!paymentUpdated) {
-    log.debug('Webhook received but no changes needed', {
+    log.debug('webhook.no_change', {
       chkId,
       status: stored.status,
       gatewayPaymentId: stored.gatewayPaymentId,
-      event: event.event,
+      gatewayEvent: event.event,
     });
   }
 
@@ -232,7 +232,7 @@ async function relayWebhook(chkId: string, event: WebhookEvent): Promise<void> {
       headers: { 'Content-Type': 'application/json' },
     });
 
-    log.info('Webhook relayed successfully', {
+    log.info('webhook.relay_succeeded', {
       chkId,
       relayUrl,
       statusCode: response.status,
@@ -243,7 +243,7 @@ async function relayWebhook(chkId: string, event: WebhookEvent): Promise<void> {
     const statusCode = axios.isAxiosError(err) ? err.response?.status : undefined;
     const errorMessage = err instanceof Error ? err.message : String(err);
 
-    log.warn('Webhook relay failed', {
+    log.warn('webhook.relay_failed', {
       chkId,
       relayUrl,
       statusCode,

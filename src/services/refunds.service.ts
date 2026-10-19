@@ -64,7 +64,7 @@ export async function createRefund(
     ...(req.reason !== undefined && { reason: req.reason }),
   };
 
-  log.info('Creating refund', {
+  log.info('refund.creating', {
     chkId,
     gateway: stored.gateway,
     gatewayPaymentId: stored.gatewayPaymentId,
@@ -92,7 +92,7 @@ export async function createRefund(
 
   await saveRefund(storeRefund);
 
-  log.info('Refund created', {
+  log.info('refund.created', {
     refId,
     chkId,
     gatewayRefundId: gatewayResult.gatewayRefundId,
@@ -109,7 +109,7 @@ export async function createRefund(
 
   await updatePaymentStatus(chkId, newPaymentStatus);
 
-  log.info('Parent payment status updated after refund', {
+  log.info('refund.payment_status_updated', {
     chkId,
     newPaymentStatus,
   });
@@ -159,7 +159,7 @@ export async function getRefundStatus(refId: string): Promise<RefundStatusRespon
   }
 
   // Stale non-terminal: re-poll gateway
-  log.info('Refund status stale — re-polling gateway', {
+  log.info('refund.status_repoll', {
     refId,
     status: stored.status,
     ageMs,
@@ -173,7 +173,7 @@ export async function getRefundStatus(refId: string): Promise<RefundStatusRespon
     stored.status = fresh.status;
     stored.updatedAt = now();
 
-    log.info('Refund status updated from gateway poll', {
+    log.info('refund.status_updated_from_poll', {
       refId,
       newStatus: fresh.status,
     });

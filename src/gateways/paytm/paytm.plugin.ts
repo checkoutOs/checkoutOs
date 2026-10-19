@@ -125,7 +125,7 @@ function isTimeoutError(err: unknown): boolean {
 function extractPaytmErrorReason(err: AxiosError): string {
   const data = err.response?.data as PaytmApiError | undefined;
 
-  log.error('Paytm API error', {
+  log.error('gateway.api_error', {
     status: err.response?.status,
     statusText: err.response?.statusText,
     url: err.config?.url,
@@ -293,7 +293,7 @@ export class PaytmPlugin implements GatewayPlugin {
 
     const request = buildPaytmRequest(body, this.creds.merchantKey);
 
-    log.info('Creating Paytm refund', {
+    log.info('gateway.refund_requested', {
       txnId: params.gatewayPaymentId,
       refId,
       amountPaise: params.amount,
@@ -309,7 +309,7 @@ export class PaytmPlugin implements GatewayPlugin {
         request,
       );
       response = httpResponse.data;
-      log.info('Paytm refund created', { refundId: response.body?.refundId });
+      log.info('gateway.refund_created', { refundId: response.body?.refundId });
     } catch (err) {
       if (isTimeoutError(err)) {
         throw new GatewayTimeoutError(this.name, 'createRefund');

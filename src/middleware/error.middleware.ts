@@ -39,7 +39,7 @@ export function errorHandler(
   // A response was partially written before the error occurred.
   // Writing again would corrupt the stream — let Express close it.
   if (res.headersSent) {
-    log.error('Error after headers sent', {
+    log.error('http.error.after_headers_sent', {
       method: req.method,
       path: req.path,
       error: err instanceof Error ? err.message : String(err),
@@ -52,18 +52,18 @@ export function errorHandler(
     // isOperational: true  = client error (bad input, not found, etc.) → warn
     // isOperational: false = system failure (redis down, gateway error) → error
     if (err.isOperational) {
-      log.warn('Operational error', {
+      log.warn('http.error.operational', {
         code: err.code,
         httpStatus: err.httpStatus,
-        message: err.message,
+        errorMessage: err.message,
         method: req.method,
         path: req.path,
       });
     } else {
-      log.error('System error', {
+      log.error('http.error.system', {
         code: err.code,
         httpStatus: err.httpStatus,
-        message: err.message,
+        errorMessage: err.message,
         method: req.method,
         path: req.path,
         stack: err.stack,
@@ -80,7 +80,7 @@ export function errorHandler(
   const message = err instanceof Error ? err.message : String(err);
   const stack = err instanceof Error ? err.stack : undefined;
 
-  log.error('Unhandled error', {
+  log.error('http.error.unhandled', {
     error: message,
     method: req.method,
     path: req.path,

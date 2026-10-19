@@ -33,7 +33,7 @@ export async function checkHealth(): Promise<HealthResponse> {
       : { healthy: false, error: String(gatewayResult.reason) };
 
   const allHealthy = redis.healthy && gateway.healthy;
-  log.debug('Sumit debug', { gatewayResult });
+  log.debug('health.gateway_result', { gatewayResult });
   const status: HealthResponse['status'] = allHealthy
     ? 'ok'
     : redis.healthy || gateway.healthy
@@ -41,7 +41,7 @@ export async function checkHealth(): Promise<HealthResponse> {
       : 'error';
 
   if (!allHealthy) {
-    log.warn('Health check degraded', { redis, gateway });
+    log.warn('health.degraded', { redis, gateway });
   }
 
   return {
@@ -59,7 +59,7 @@ async function checkGateway(): Promise<ServiceHealth> {
     return { healthy: result.healthy, latencyMs: result.latencyMs };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    log.error('Gateay health check failed', { error: message });
+    log.error('health.gateway_check_failed', { error: message });
     return { healthy: false, error: message };
   }
 }
@@ -70,7 +70,7 @@ async function checkRedis(): Promise<ServiceHealth> {
     return { healthy: true, latencyMs };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    log.error('Redis health check failed', { error: message });
+    log.error('health.redis_check_failed', { error: message });
     return { healthy: false, error: message };
   }
 }
