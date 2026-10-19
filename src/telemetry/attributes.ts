@@ -19,7 +19,7 @@
 // so this file still loads nothing before instrumentation (see tracing.ts).
 
 import type { Attributes } from '@opentelemetry/api';
-import type { GatewayName } from '../types/payment.types';
+import type { Currency, GatewayName, PaymentStatus } from '../types/payment.types';
 
 // ── Closed sets ─────────────────────────────────────────────────────────────
 
@@ -57,6 +57,78 @@ export const HTTP_ROUTES = [
   '/checkout/:chkId',
 ] as const;
 export type HttpRoute = (typeof HTTP_ROUTES)[number];
+
+// PaymentStatus values. Template-literal type over an `import type`, so the
+// enum itself is never loaded here; the attributes test checks exhaustiveness.
+type PaymentStatusValue = `${PaymentStatus}`;
+export const PAYMENT_STATUSES = [
+  'PENDING',
+  'PROCESSING',
+  'SUCCESS',
+  'FAILED',
+  'REFUNDED',
+  'PARTIALLY_REFUNDED',
+  'CANCELLED',
+  'EXPIRED',
+] as const satisfies readonly PaymentStatusValue[];
+
+export const CURRENCIES = ['INR'] as const satisfies readonly Currency[];
+
+// Gateway-native webhook event names, as WebhookEvent.event carries them:
+// Razorpay's event types and Paytm's TXN STATUS values. Anything else is
+// "other". The attributes test checks these against the plugin types.
+export const WEBHOOK_EVENTS = [
+  'payment.authorized',
+  'payment.captured',
+  'payment.failed',
+  'refund.processed',
+  'refund.failed',
+  'TXN_SUCCESS',
+  'TXN_FAILURE',
+  'PENDING',
+] as const;
+export const OTHER_EVENT = 'other';
+
+// What processWebhook did with one delivery.
+export const WEBHOOK_RESULTS = [
+  'updated', // gatewayPaymentId backfilled and/or status transitioned
+  'unchanged', // duplicate / same-status delivery
+  'blocked', // state machine refused the transition
+  'unknown_payment', // no chk_ ID for the gateway IDs
+  'record_missing', // chk_ ID found, payment hash gone
+  'rejected', // parseWebhookEvent threw (bad signature, malformed body)
+  'error', // failed after parsing (e.g. Redis)
+] as const;
+export type WebhookResult = (typeof WEBHOOK_RESULTS)[number];
+
+// Where a payment status change came from.
+export const TRANSITION_SOURCES = ['webhook', 'poll', 'refund'] as const;
+export type TransitionSource = (typeof TRANSITION_SOURCES)[number];
+
+export const RELAY_OUTCOMES = ['success', 'http_error', 'timeout', 'network_error'] as const;
+export type RelayOutcome = (typeof RELAY_OUTCOMES)[number];
+
+// One per checkIdempotency() decision (ADR 003 §6.4).
+export const IDEMPOTENCY_RESULTS = [
+  'miss',
+  'hit',
+  'in_progress',
+  'stale_recovered',
+  'hash_mismatch',
+] as const;
+export type IdempotencyResult = (typeof IDEMPOTENCY_RESULTS)[number];
+
+// Why reserveOrderId() lost: another payment owns the orderId.
+export const ORDERID_CONFLICT_RESULTS = [
+  'deduplicated', // same amount + currency — existing payment served
+  'in_progress', // concurrent create holds the reservation → 409
+  'amount_mismatch',
+  'currency_mismatch',
+] as const;
+export type OrderIdConflictResult = (typeof ORDERID_CONFLICT_RESULTS)[number];
+
+export const REFUND_OUTCOMES = ['created', 'rejected', 'gateway_error'] as const;
+export type RefundOutcome = (typeof REFUND_OUTCOMES)[number];
 
 // ── Fallbacks ───────────────────────────────────────────────────────────────
 
@@ -102,6 +174,90 @@ export function gatewayLabels(
  */
 export function webhookLabels(gateway: GatewayName): Attributes {
   return { gateway: oneOf(METRIC_GATEWAYS, gateway) };
+}
+
+/** Labels for `webhook.received`. event is undefined when parsing failed. */
+export function webhookReceivedLabels(
+  gateway: GatewayName,
+  event: string | undefined,
+  result: WebhookResult,
+): Attributes {
+  return {
+    gateway: oneOf(METRIC_GATEWAYS, gateway),
+    event:
+      event !== undefined && (WEBHOOK_EVENTS as readonly string[]).includes(event)
+        ? event
+        : OTHER_EVENT,
+    result: oneOf(WEBHOOK_RESULTS, result),
+  };
+}
+
+/** Labels for `webhook.relay.attempts`. */
+export function relayLabels(outcome: RelayOutcome): Attributes {
+  return { outcome: oneOf(RELAY_OUTCOMES, outcome) };
+}
+
+/** Labels for `gateway.poll_success_suppressed`. */
+export function pollLabels(gateway: GatewayName): Attributes {
+  return { gateway: oneOf(METRIC_GATEWAYS, gateway) };
+}
+
+/** Labels for `payments.created`. status is a PaymentStatus value. */
+export function paymentCreatedLabels(
+  gateway: GatewayName,
+  currency: string,
+  status: string,
+): Attributes {
+  return {
+    gateway: oneOf(METRIC_GATEWAYS, gateway),
+    currency: oneOf(CURRENCIES, currency),
+    status: oneOf(PAYMENT_STATUSES, status),
+  };
+}
+
+/**
+ * Labels for `payment.transitions` (source = who changed it) and
+ * `payment.transitions_blocked` (always source 'webhook' — only webhooks go
+ * through the state machine).
+ */
+export function transitionLabels(
+  gateway: GatewayName,
+  from: string,
+  to: string,
+  source: TransitionSource,
+): Attributes {
+  return {
+    gateway: oneOf(METRIC_GATEWAYS, gateway),
+    from: oneOf(PAYMENT_STATUSES, from),
+    to: oneOf(PAYMENT_STATUSES, to),
+    source: oneOf(TRANSITION_SOURCES, source),
+  };
+}
+
+/** Labels for `idempotency.decisions`. */
+export function idempotencyLabels(result: IdempotencyResult): Attributes {
+  return { result: oneOf(IDEMPOTENCY_RESULTS, result) };
+}
+
+/** Labels for `orderid.reservation_conflicts`. */
+export function orderIdConflictLabels(result: OrderIdConflictResult): Attributes {
+  return { result: oneOf(ORDERID_CONFLICT_RESULTS, result) };
+}
+
+/** Labels for `refunds`. */
+export function refundLabels(gateway: GatewayName, outcome: RefundOutcome): Attributes {
+  return {
+    gateway: oneOf(METRIC_GATEWAYS, gateway),
+    outcome: oneOf(REFUND_OUTCOMES, outcome),
+  };
+}
+
+/** Labels for `refund.amount_minor`. */
+export function refundAmountLabels(gateway: GatewayName, currency: string): Attributes {
+  return {
+    gateway: oneOf(METRIC_GATEWAYS, gateway),
+    currency: oneOf(CURRENCIES, currency),
+  };
 }
 
 /**

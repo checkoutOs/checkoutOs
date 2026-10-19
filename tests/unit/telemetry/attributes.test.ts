@@ -19,6 +19,13 @@ import {
   httpLabels,
   buildInfoLabels,
   METRIC_GATEWAYS,
+  PAYMENT_STATUSES,
+  WEBHOOK_EVENTS,
+  OTHER_EVENT,
+  paymentCreatedLabels,
+  transitionLabels,
+  webhookReceivedLabels,
+  refundAmountLabels,
   HTTP_ROUTES,
   UNKNOWN,
   OTHER_METHOD,
@@ -28,6 +35,23 @@ import {
   type HttpRoute,
 } from '../../../src/telemetry/attributes';
 import { supportedGateways } from '../../../src/gateways/gateway.registry';
+import { PaymentStatus } from '../../../src/types/payment.types';
+import type { RazorpayWebhookEvent } from '../../../src/gateways/razorpay/razorpay.types';
+import type { PaytmTxnStatus } from '../../../src/gateways/paytm/paytm.types';
+
+// Every event name a plugin can put in WebhookEvent.event. A Record over the
+// union, so adding a member to either type is a compile error here until it
+// is listed — and then the test below requires WEBHOOK_EVENTS to carry it.
+const PLUGIN_EVENTS: Record<RazorpayWebhookEvent | PaytmTxnStatus, true> = {
+  'payment.authorized': true,
+  'payment.captured': true,
+  'payment.failed': true,
+  'refund.processed': true,
+  'refund.failed': true,
+  TXN_SUCCESS: true,
+  TXN_FAILURE: true,
+  PENDING: true,
+};
 
 const SRC = resolve(__dirname, '../../../src');
 
@@ -52,6 +76,14 @@ function mountedRoutes(): string[] {
 }
 
 describe('closed sets', () => {
+  it('PAYMENT_STATUSES matches the PaymentStatus enum', () => {
+    expect([...PAYMENT_STATUSES].sort()).toEqual(Object.values(PaymentStatus).sort());
+  });
+
+  it('WEBHOOK_EVENTS matches every event name the plugins emit', () => {
+    expect([...WEBHOOK_EVENTS].sort()).toEqual(Object.keys(PLUGIN_EVENTS).sort());
+  });
+
   it('METRIC_GATEWAYS matches supportedGateways in the registry', () => {
     expect([...METRIC_GATEWAYS].sort()).toEqual([...supportedGateways].sort());
   });
@@ -122,6 +154,37 @@ describe('httpLabels', () => {
   it('maps an impossible status code to 0', () => {
     expect(httpLabels('GET', '/health', 9999)['http.response.status_code']).toBe(0);
     expect(httpLabels('GET', '/health', 200.5)['http.response.status_code']).toBe(0);
+  });
+});
+
+describe('domain builders', () => {
+  it('close status, currency and gateway', () => {
+    expect(paymentCreatedLabels('razorpay', 'INR', 'PENDING')).toEqual({
+      gateway: 'razorpay',
+      currency: 'INR',
+      status: 'PENDING',
+    });
+    expect(paymentCreatedLabels('razorpay', 'USD', 'chk_123')).toEqual({
+      gateway: 'razorpay',
+      currency: UNKNOWN,
+      status: UNKNOWN,
+    });
+    expect(refundAmountLabels('paytm', 'EUR')).toEqual({ gateway: 'paytm', currency: UNKNOWN });
+  });
+
+  it('close both ends of a transition', () => {
+    expect(transitionLabels('paytm', 'PENDING', 'pay_XYZ', 'webhook')).toEqual({
+      gateway: 'paytm',
+      from: 'PENDING',
+      to: UNKNOWN,
+      source: 'webhook',
+    });
+  });
+
+  it('collapse an unlisted gateway event name', () => {
+    expect(webhookReceivedLabels('razorpay', 'order.paid', 'updated').event).toBe(OTHER_EVENT);
+    expect(webhookReceivedLabels('razorpay', undefined, 'rejected').event).toBe(OTHER_EVENT);
+    expect(webhookReceivedLabels('paytm', 'TXN_SUCCESS', 'updated').event).toBe('TXN_SUCCESS');
   });
 });
 
