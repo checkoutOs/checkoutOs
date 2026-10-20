@@ -1,0 +1,17 @@
+# .dockerignore
+# Keep the build context small and secret-free. The Dockerfiles COPY only
+# package*.json, tsconfig.json, src/ and mocks/ — nothing below is needed, and
+# .env must never reach a build context (it holds gateway credentials).
+
+node_modules
+dist
+coverage
+.git
+.env
+.env.*
+!.env.example
+*.log
+observability
+docs
+projectSpec
+tests
