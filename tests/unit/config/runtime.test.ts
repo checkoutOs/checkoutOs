@@ -71,6 +71,8 @@ describe('loadRuntime', () => {
       metricsPort: 9464,
       metricsAuthToken: undefined,
       otlpMetricsEnabled: false,
+      otlpTracesEnabled: false,
+      traceSampleRatio: 0.1,
     });
   });
 
@@ -119,6 +121,33 @@ describe('loadRuntime', () => {
     // Nothing leaves the box by default (ADR 003 §2.3).
     expect(loadRuntime({ OTEL_EXPORTER_OTLP_ENDPOINT: '  ' }).otlpMetricsEnabled).toBe(false);
   });
+
+  it.each(['OTEL_EXPORTER_OTLP_ENDPOINT', 'OTEL_EXPORTER_OTLP_TRACES_ENDPOINT'])(
+    'enables trace export when %s is set',
+    (key) => {
+      expect(loadRuntime({ [key]: 'http://tempo:4318' }).otlpTracesEnabled).toBe(true);
+    },
+  );
+
+  it('keeps trace export off for a blank or metrics-only endpoint', () => {
+    expect(loadRuntime({ OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: ' ' }).otlpTracesEnabled).toBe(false);
+    expect(
+      loadRuntime({ OTEL_EXPORTER_OTLP_METRICS_ENDPOINT: 'http://c:4318' }).otlpTracesEnabled,
+    ).toBe(false);
+  });
+
+  it('reads TRACE_SAMPLE_RATIO', () => {
+    expect(loadRuntime({ TRACE_SAMPLE_RATIO: '0.25' }).traceSampleRatio).toBe(0.25);
+    expect(loadRuntime({ TRACE_SAMPLE_RATIO: '0' }).traceSampleRatio).toBe(0);
+    expect(loadRuntime({ TRACE_SAMPLE_RATIO: '1' }).traceSampleRatio).toBe(1);
+  });
+
+  it.each(['abc', '-0.1', '1.5', '', 'NaN'])(
+    'falls back to 0.1 for an invalid TRACE_SAMPLE_RATIO %j',
+    (value) => {
+      expect(loadRuntime({ TRACE_SAMPLE_RATIO: value }).traceSampleRatio).toBe(0.1);
+    },
+  );
 
   it('treats an empty APP_VERSION as unset', () => {
     expect(loadRuntime({ APP_VERSION: '' }).version).toBe('0.0.0');

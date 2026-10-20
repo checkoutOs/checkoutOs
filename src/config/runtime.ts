@@ -29,9 +29,15 @@ export interface Runtime {
   metricsPort: number;
   metricsAuthToken: string | undefined;
   otlpMetricsEnabled: boolean;
+  otlpTracesEnabled: boolean;
+  traceSampleRatio: number;
 }
 
 const DEFAULT_METRICS_PORT = 9464;
+// Share of non-error traces exported; error traces are always kept (ADR 003 §5 Phase 6).
+const DEFAULT_TRACE_SAMPLE_RATIO = 0.1;
+
+const isSet = (value: string | undefined): boolean => value !== undefined && value.trim() !== '';
 
 export function loadRuntime(source: Record<string, string | undefined> = process.env): Runtime {
   const env = source['NODE_ENV'] ?? 'development';
@@ -48,7 +54,20 @@ export function loadRuntime(source: Record<string, string | undefined> = process
   const otlpMetricsEnabled = [
     source['OTEL_EXPORTER_OTLP_ENDPOINT'],
     source['OTEL_EXPORTER_OTLP_METRICS_ENDPOINT'],
-  ].some((value): boolean => value !== undefined && value.trim() !== '');
+  ].some(isSet);
+
+  // Traces leave the box only when an endpoint is configured — otherwise spans
+  // are still created (trace_id on every log line) but exported nowhere.
+  const otlpTracesEnabled = [
+    source['OTEL_EXPORTER_OTLP_ENDPOINT'],
+    source['OTEL_EXPORTER_OTLP_TRACES_ENDPOINT'],
+  ].some(isSet);
+
+  const ratio = Number(source['TRACE_SAMPLE_RATIO']);
+  const traceSampleRatio =
+    isSet(source['TRACE_SAMPLE_RATIO']) && Number.isFinite(ratio) && ratio >= 0 && ratio <= 1
+      ? ratio
+      : DEFAULT_TRACE_SAMPLE_RATIO;
 
   return {
     env,
@@ -59,5 +78,7 @@ export function loadRuntime(source: Record<string, string | undefined> = process
     metricsPort,
     metricsAuthToken: token !== undefined && token !== '' ? token : undefined,
     otlpMetricsEnabled,
+    otlpTracesEnabled,
+    traceSampleRatio,
   };
 }

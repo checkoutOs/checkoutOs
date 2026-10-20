@@ -74,6 +74,15 @@ const BaseEnvSchema = z.object({
   // Unset → no auth on /metrics (network isolation assumed).
   METRICS_AUTH_TOKEN: z.string().min(1, 'METRICS_AUTH_TOKEN must not be empty when set').optional(),
 
+  // Share of NON-error traces exported when an OTLP traces endpoint is set;
+  // traces containing an error are always exported. Read early by
+  // config/runtime.ts — validated here so a bad value still fails startup.
+  TRACE_SAMPLE_RATIO: z.coerce
+    .number()
+    .min(0, 'TRACE_SAMPLE_RATIO must be between 0 and 1')
+    .max(1, 'TRACE_SAMPLE_RATIO must be between 0 and 1')
+    .default(0.1),
+
   // ── Razorpay credentials ───────────────────────────────────────────────────
   // Optional at schema level — conditionally required in superRefine below
   // when ACTIVE_GATEWAY=razorpay.
