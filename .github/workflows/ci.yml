@@ -64,6 +64,17 @@ jobs:
       - name: Log event names
         run: node scripts/log-events.mjs check
 
+      # Dashboards are generated (scripts/build-dashboards.mjs); fail if the
+      # committed JSON is stale, then syntax-check every panel query and run
+      # the alert rules' promtool unit tests (ADR 003 §10).
+      - name: Dashboards and alerts
+        run: |
+          node scripts/build-dashboards.mjs --check --promql-rules "$RUNNER_TEMP/dashboard-queries.yml"
+          docker run --rm --entrypoint promtool -v "$RUNNER_TEMP:/q" \
+            prom/prometheus:v3.5.0 check rules --lint=none /q/dashboard-queries.yml
+          docker run --rm --entrypoint promtool -v "$PWD/observability/prometheus:/r" \
+            prom/prometheus:v3.5.0 test rules /r/alerts.test.yml
+
       # One step, as specified: each stage runs only if the previous passed.
       # Integration tests hit the real Razorpay sandbox (see AGENTS.md).
       - name: Tests and telemetry
