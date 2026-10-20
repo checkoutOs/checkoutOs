@@ -5,6 +5,8 @@
 #
 #   docker compose --profile metrics up -d --build        # + Prometheus, Grafana
 #   docker compose --profile observability up -d --build  # + Loki, Alloy
+#   OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://tempo:4318/v1/traces \
+#     docker compose --profile tracing up -d --build       # + Tempo
 #
 #   metrics:  checkoutos:9464/metrics → Prometheus → Grafana
 #   logs:     checkoutos stdout (JSON) → Docker json-file → Alloy → Loki → Grafana
@@ -47,6 +49,7 @@ services:
     profiles:
       - metrics
       - observability
+      - tracing
 
   # ── Loki — log store ───────────────────────────────────────────────────────
   loki:
@@ -67,6 +70,7 @@ services:
       - observability
     profiles:
       - observability
+      - tracing
 
   # ── Alloy — tails container stdout, ships to Loki ──────────────────────────
   # Reads logs through the Docker API, so it needs the socket (read-only).
@@ -92,6 +96,32 @@ services:
       - observability
     profiles:
       - observability
+      - tracing
+
+  # ── Tempo — trace store (profile: tracing) ─────────────────────────────────
+  # Receives OTLP from checkoutOs on checkoutos-network. checkoutOs exports
+  # only when OTEL_EXPORTER_OTLP_TRACES_ENDPOINT is set — the tracing profile
+  # alone does not turn export on (see the root docker-compose.yml).
+  tempo:
+    image: grafana/tempo:2.8.2
+    container_name: checkoutos-tempo
+    restart: unless-stopped
+    command: ['-config.file=/etc/tempo/tempo.yml']
+    volumes:
+      - ./tempo/tempo.yml:/etc/tempo/tempo.yml:ro
+      - tempo_data:/var/tempo
+    healthcheck:
+      # Exec form: the Tempo image has no shell. wget fails on /ready's 503.
+      test: ['CMD', 'wget', '-q', '-O', '/dev/null', 'http://localhost:3200/ready']
+      interval: 10s
+      timeout: 5s
+      start_period: 30s
+      retries: 10
+    networks:
+      - checkoutos-network
+      - observability
+    profiles:
+      - tracing
 
   # ── Grafana — query UI ─────────────────────────────────────────────────────
   # Port 3001: 3000 is the checkoutOs API. Both datasources are always
@@ -121,15 +151,20 @@ services:
       loki:
         condition: service_healthy
         required: false
+      tempo:
+        condition: service_healthy
+        required: false
     networks:
       - observability
     profiles:
       - metrics
       - observability
+      - tracing
 
 volumes:
   prometheus_data:
   loki_data:
+  tempo_data:
   alloy_data:
   grafana_data:
 

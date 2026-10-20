@@ -14,6 +14,8 @@
 #                                  # + Prometheus, Grafana on :3001 (ADR 003)
 #   docker compose --profile observability up -d --build
 #                                  # + Loki and Alloy as well
+#   docker compose --profile tracing up -d --build
+#                                  # + Tempo (set OTEL_EXPORTER_OTLP_TRACES_ENDPOINT)
 #
 # Prerequisites:
 #   cp .env.example .env
@@ -89,6 +91,13 @@ services:
       # Override REDIS_URL to use the Redis service by container name
       # This takes precedence over any value in .env
       REDIS_URL: redis://redis:6379
+      # Traces (ADR 003 §5 Phase 6). Empty → spans are exported nowhere. With the
+      # tracing profile, run:
+      #   OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://tempo:4318/v1/traces \
+      #     docker compose --profile tracing up -d --build
+      # (or set it in .env). Exporting to a Tempo that is not running only
+      # costs dropped batches, but keep it opt-in.
+      OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: ${OTEL_EXPORTER_OTLP_TRACES_ENDPOINT:-}
     depends_on:
       redis:
         condition: service_healthy
