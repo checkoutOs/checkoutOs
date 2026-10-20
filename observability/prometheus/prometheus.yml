@@ -6,6 +6,11 @@ global:
   scrape_interval: 15s
   evaluation_interval: 15s
 
+# Starter alerts (ADR 003 §10.2). No Alertmanager is wired: firing alerts show
+# in Prometheus and Grafana. Point alerting.alertmanagers at yours to notify.
+rule_files:
+  - /etc/prometheus/alerts.yml
+
 scrape_configs:
   - job_name: checkoutos
     static_configs:

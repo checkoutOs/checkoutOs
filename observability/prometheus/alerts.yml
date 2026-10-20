@@ -1,0 +1,127 @@
+# observability/prometheus/alerts.yml
+# Starter alert rules for checkoutOs (ADR 003 §10.2). Metric reference:
+# docs/metrics.md.
+#
+# Rules:
+#   - Every latency threshold sits ON a bucket boundary (src/telemetry/
+#     buckets.ts) — histogram_quantile() interpolates between boundaries, so a
+#     threshold between two buckets is a guess. Pinned by
+#     tests/unit/observability/alerts.test.ts.
+#   - Every rule has a firing case in alerts.test.yml (promtool test rules).
+#   - Ratios guard against 0/0: no traffic is not an incident.
+#
+# Validate:  docker run --rm --entrypoint promtool -v "$PWD/observability/prometheus:/r" \
+#              prom/prometheus:v3.5.0 test rules /r/alerts.test.yml
+
+groups:
+  - name: checkoutos-payments
+    rules:
+      - alert: PaymentCreationFailureRate
+        # Failed createPayment calls, per gateway. 2% for 5m: gateway degradation
+        # and the failover trigger.
+        expr: |
+          (
+            sum by (gateway) (rate(checkoutos_gateway_requests_total{operation="createPayment", outcome!="success"}[5m]))
+            /
+            sum by (gateway) (rate(checkoutos_gateway_requests_total{operation="createPayment"}[5m]))
+          ) > 0.02
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: '{{ $labels.gateway }}: {{ $value | humanizePercentage }} of payment creations failing'
+          description: >-
+            More than 2% of createPayment calls to {{ $labels.gateway }} failed over 5m.
+            Break down by outcome (timeout / gateway_error / mapping_error) on the
+            Gateways dashboard.
+
+      - alert: PaymentsAwaitingWebhook
+        # Polls saw SUCCESS but held it back (SUCCESS is webhook-only): money is
+        # captured but webhooks are not arriving, so those payments cannot be
+        # refunded. Becomes a gauge once payments_awaiting_webhook lands (§6.2).
+        expr: sum by (gateway) (rate(checkoutos_gateway_poll_success_suppressed_total[30m])) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: '{{ $labels.gateway }}: captured payments waiting for their webhook'
+          description: >-
+            Status polls keep seeing SUCCESS for payments still PENDING in checkoutOs.
+            Check the gateway's webhook configuration and webhook.signature_failures.
+
+      - alert: TransitionsBlockedSpike
+        # The state machine is refusing webhook status changes — usually a gateway
+        # event mapped to the wrong status (e.g. refund.processed → REFUNDED on a
+        # SUCCESS payment).
+        expr: sum by (gateway, from, to) (rate(checkoutos_payment_transitions_blocked_total[15m])) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: '{{ $labels.gateway }}: webhooks keep trying {{ $labels.from }} → {{ $labels.to }}'
+          description: >-
+            Sustained blocked transitions for one from/to pair. Check how the
+            gateway's webhook events map to payment statuses.
+
+  - name: checkoutos-gateways
+    rules:
+      - alert: GatewayLatencyP99High
+        # p99 above 8s = 80% of the 10s gateway timeout. 8 is a bucket boundary in
+        # GATEWAY_REQUEST_BUCKETS for exactly this alert.
+        expr: |
+          histogram_quantile(0.99,
+            sum by (gateway, operation, le) (rate(checkoutos_gateway_request_duration_bucket[5m]))
+          ) > 8
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: '{{ $labels.gateway }} {{ $labels.operation }}: p99 latency above 8s'
+          description: >-
+            p99 is within 20% of the 10s timeout; timeouts (outcome="timeout") follow.
+
+  - name: checkoutos-webhooks
+    rules:
+      - alert: WebhookRelayFailing
+        # Relay is fire-and-forget: a failing merchant endpoint is silent data loss.
+        expr: |
+          (
+            sum(rate(checkoutos_webhook_relay_attempts_total{outcome!="success"}[10m]))
+            /
+            sum(rate(checkoutos_webhook_relay_attempts_total[10m]))
+          ) > 0.05
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: '{{ $value | humanizePercentage }} of webhook relays to WEBHOOK_RELAY_URL failing'
+          description: >-
+            Merchants are not receiving payment events. Break down by outcome
+            (http_error / timeout / network_error); replay from webhook.relay_failed logs.
+
+      - alert: GatewaySignatureFailures
+        # Inbound webhooks with a bad signature/checksum. Sustained = misconfigured
+        # webhook secret, or a forgery attempt.
+        expr: sum by (gateway) (rate(checkoutos_webhook_signature_failures_total[5m])) > 0
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: '{{ $labels.gateway }}: webhooks failing signature verification'
+          description: >-
+            Either the webhook secret does not match the gateway dashboard, or someone
+            is sending forged webhooks. Both are urgent.
+
+  - name: checkoutos-availability
+    rules:
+      - alert: MetricsEndpointDown
+        # Free liveness from pull: the scrape itself failed.
+        expr: up{job="checkoutos"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: 'checkoutOs /metrics unreachable on {{ $labels.instance }}'
+          description: >-
+            Prometheus cannot scrape checkoutos:9464 — the process is down, the
+            metrics listener failed, or METRICS_AUTH_TOKEN does not match.

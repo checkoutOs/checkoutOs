@@ -1,0 +1,177 @@
+# observability/prometheus/alerts.test.yml
+# promtool unit tests for alerts.yml — each rule fires on synthetic data, and
+# the ratio rules stay quiet below threshold and with no traffic.
+#
+#   docker run --rm --entrypoint promtool -v "$PWD/observability/prometheus:/r" \
+#     prom/prometheus:v3.5.0 test rules /r/alerts.test.yml
+
+rule_files:
+  - alerts.yml
+
+evaluation_interval: 1m
+
+tests:
+  # ── PaymentCreationFailureRate ────────────────────────────────────────────
+  - interval: 1m
+    input_series:
+      # 100 calls/min, 5 failing (5%) on razorpay; 100/min, 1 failing (1%) on paytm
+      - series: 'checkoutos_gateway_requests_total{gateway="razorpay",operation="createPayment",outcome="success"}'
+        values: '0+95x20'
+      - series: 'checkoutos_gateway_requests_total{gateway="razorpay",operation="createPayment",outcome="timeout"}'
+        values: '0+5x20'
+      - series: 'checkoutos_gateway_requests_total{gateway="paytm",operation="createPayment",outcome="success"}'
+        values: '0+99x20'
+      - series: 'checkoutos_gateway_requests_total{gateway="paytm",operation="createPayment",outcome="gateway_error"}'
+        values: '0+1x20'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: PaymentCreationFailureRate
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              gateway: razorpay
+            exp_annotations:
+              summary: 'razorpay: 5% of payment creations failing'
+              description: 'More than 2% of createPayment calls to razorpay failed over 5m. Break down by outcome (timeout / gateway_error / mapping_error) on the Gateways dashboard.'
+
+  - interval: 1m
+    input_series:
+      # No traffic at all: 0/0 must not fire
+      - series: 'checkoutos_gateway_requests_total{gateway="razorpay",operation="createPayment",outcome="success"}'
+        values: '0x20'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: PaymentCreationFailureRate
+        exp_alerts: []
+
+  # ── PaymentsAwaitingWebhook ───────────────────────────────────────────────
+  - interval: 1m
+    input_series:
+      - series: 'checkoutos_gateway_poll_success_suppressed_total{gateway="razorpay"}'
+        values: '0+1x60'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: PaymentsAwaitingWebhook
+        exp_alerts: []
+      - eval_time: 50m
+        alertname: PaymentsAwaitingWebhook
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              gateway: razorpay
+            exp_annotations:
+              summary: 'razorpay: captured payments waiting for their webhook'
+              description: "Status polls keep seeing SUCCESS for payments still PENDING in checkoutOs. Check the gateway's webhook configuration and webhook.signature_failures."
+
+  # ── TransitionsBlockedSpike ───────────────────────────────────────────────
+  - interval: 1m
+    input_series:
+      - series: 'checkoutos_payment_transitions_blocked_total{gateway="razorpay",from="SUCCESS",to="REFUNDED",source="webhook",otel_scope_name="checkoutos"}'
+        values: '0+1x40'
+    alert_rule_test:
+      - eval_time: 35m
+        alertname: TransitionsBlockedSpike
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              gateway: razorpay
+              from: SUCCESS
+              to: REFUNDED
+            exp_annotations:
+              summary: 'razorpay: webhooks keep trying SUCCESS → REFUNDED'
+              description: "Sustained blocked transitions for one from/to pair. Check how the gateway's webhook events map to payment statuses."
+
+  # ── GatewayLatencyP99High ─────────────────────────────────────────────────
+  - interval: 1m
+    input_series:
+      # Every call lands between 8s and 10s → p99 interpolates to ~9.98s (> 8)
+      - series: 'checkoutos_gateway_request_duration_bucket{gateway="paytm",operation="createPayment",outcome="success",le="5"}'
+        values: '0x30'
+      - series: 'checkoutos_gateway_request_duration_bucket{gateway="paytm",operation="createPayment",outcome="success",le="8"}'
+        values: '0x30'
+      - series: 'checkoutos_gateway_request_duration_bucket{gateway="paytm",operation="createPayment",outcome="success",le="10"}'
+        values: '0+10x30'
+      - series: 'checkoutos_gateway_request_duration_bucket{gateway="paytm",operation="createPayment",outcome="success",le="+Inf"}'
+        values: '0+10x30'
+      # A healthy gateway: everything under 1s
+      - series: 'checkoutos_gateway_request_duration_bucket{gateway="razorpay",operation="createPayment",outcome="success",le="1"}'
+        values: '0+10x30'
+      - series: 'checkoutos_gateway_request_duration_bucket{gateway="razorpay",operation="createPayment",outcome="success",le="+Inf"}'
+        values: '0+10x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: GatewayLatencyP99High
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              gateway: paytm
+              operation: createPayment
+            exp_annotations:
+              summary: 'paytm createPayment: p99 latency above 8s'
+              description: 'p99 is within 20% of the 10s timeout; timeouts (outcome="timeout") follow.'
+
+  # ── WebhookRelayFailing ───────────────────────────────────────────────────
+  - interval: 1m
+    input_series:
+      # 10% failing
+      - series: 'checkoutos_webhook_relay_attempts_total{outcome="success"}'
+        values: '0+9x30'
+      - series: 'checkoutos_webhook_relay_attempts_total{outcome="http_error"}'
+        values: '0+1x30'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: WebhookRelayFailing
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: '10% of webhook relays to WEBHOOK_RELAY_URL failing'
+              description: 'Merchants are not receiving payment events. Break down by outcome (http_error / timeout / network_error); replay from webhook.relay_failed logs.'
+
+  - interval: 1m
+    input_series:
+      # 2% failing — below the 5% threshold
+      - series: 'checkoutos_webhook_relay_attempts_total{outcome="success"}'
+        values: '0+49x30'
+      - series: 'checkoutos_webhook_relay_attempts_total{outcome="timeout"}'
+        values: '0+1x30'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: WebhookRelayFailing
+        exp_alerts: []
+
+  # ── GatewaySignatureFailures ──────────────────────────────────────────────
+  - interval: 1m
+    input_series:
+      - series: 'checkoutos_webhook_signature_failures_total{gateway="paytm"}'
+        values: '0+2x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: GatewaySignatureFailures
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              gateway: paytm
+            exp_annotations:
+              summary: 'paytm: webhooks failing signature verification'
+              description: 'Either the webhook secret does not match the gateway dashboard, or someone is sending forged webhooks. Both are urgent.'
+
+  # ── MetricsEndpointDown ───────────────────────────────────────────────────
+  - interval: 1m
+    input_series:
+      - series: 'up{job="checkoutos",instance="checkoutos:9464"}'
+        values: '1 1 0 0 0 0'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: MetricsEndpointDown
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: MetricsEndpointDown
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: checkoutos
+              instance: checkoutos:9464
+            exp_annotations:
+              summary: 'checkoutOs /metrics unreachable on checkoutos:9464'
+              description: 'Prometheus cannot scrape checkoutos:9464 — the process is down, the metrics listener failed, or METRICS_AUTH_TOKEN does not match.'
