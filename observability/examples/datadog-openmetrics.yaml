@@ -1,0 +1,22 @@
+# observability/examples/datadog-openmetrics.yaml
+# Datadog Agent `openmetrics` check scraping checkoutOs — no Prometheus
+# anywhere (ADR 003 §9). Install as conf.d/openmetrics.d/conf.yaml.
+#
+# Names: the exposition is checkoutos_*; raw_metric_prefix strips it and
+# namespace re-adds it Datadog-style, so checkoutos_payments_created_total
+# arrives as checkoutos.payments_created.count.
+
+init_config:
+
+instances:
+  - openmetrics_endpoint: http://checkoutos:9464/metrics
+    namespace: checkoutos
+    raw_metric_prefix: checkoutos_
+    metrics:
+      - .+
+    # Histograms as distributions, so p95/p99 are computed server-side from
+    # the same buckets the starter alerts use.
+    histogram_buckets_as_distributions: true
+    # Only when METRICS_AUTH_TOKEN is set on checkoutOs:
+    # headers:
+    #   Authorization: Bearer <METRICS_AUTH_TOKEN>

@@ -1,0 +1,25 @@
+# observability/examples/prometheus.yml
+# Standalone Prometheus scraping checkoutOs (ADR 003 §9). Metric reference:
+# docs/metrics.md. The compose `metrics` profile runs ../prometheus/prometheus.yml,
+# which is this plus the starter alerts.
+#
+# Validate: promtool check config prometheus.yml
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - alerts.yml # copy ../prometheus/alerts.yml next to this file
+
+scrape_configs:
+  - job_name: checkoutos # the alerts match on job="checkoutos" — keep the name
+    scrape_interval: 15s
+    static_configs:
+      # One target per checkoutOs instance. Port 9464 (METRICS_PORT) — never
+      # the API port, and never exposed publicly.
+      - targets: ['checkoutos:9464']
+    # Only when METRICS_AUTH_TOKEN is set on checkoutOs:
+    # authorization:
+    #   type: Bearer
+    #   credentials_file: /etc/prometheus/checkoutos-metrics-token
