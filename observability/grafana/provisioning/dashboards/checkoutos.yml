@@ -1,0 +1,14 @@
+# observability/grafana/provisioning/dashboards/checkoutos.yml
+# Loads the generated dashboards (scripts/build-dashboards.mjs) into a
+# "checkoutOs" folder. Read-only in the UI: edit the generator, not Grafana.
+apiVersion: 1
+
+providers:
+  - name: checkoutos
+    folder: checkoutOs
+    type: file
+    disableDeletion: true
+    allowUiUpdates: false
+    updateIntervalSeconds: 30
+    options:
+      path: /etc/grafana/dashboards
