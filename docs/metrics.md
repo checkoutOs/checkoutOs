@@ -7,7 +7,7 @@ GET http://<host>:9464/metrics          # METRICS_PORT, default 9464
 Authorization: Bearer <METRICS_AUTH_TOKEN>   # only if METRICS_AUTH_TOKEN is set
 ```
 
-Any Prometheus-compatible scraper works: Prometheus, Grafana Alloy, the Datadog Agent (`openmetrics` check), or the OpenTelemetry Collector (`prometheusreceiver`). `observability/prometheus/prometheus.yml` is a working example. The design is in [ADR 003](adr/003-observabilityPlan.md).
+Any Prometheus-compatible scraper works: Prometheus, Grafana Alloy, the Datadog Agent (`openmetrics` check), or the OpenTelemetry Collector (`prometheusreceiver`). Ready-made configs are in [`observability/examples/`](../observability/examples/). Starter alerts are in [`observability/prometheus/alerts.yml`](../observability/prometheus/alerts.yml). Grafana dashboards are in [`observability/grafana/dashboards/`](../observability/grafana/dashboards/); run `docker compose --profile metrics up` to see them. The design is in [ADR 003](adr/003-observabilityPlan.md).
 
 **This page is the contract.** Metric names, label keys, label values and bucket boundaries are a public API. See the [stability policy](#stability-policy).
 

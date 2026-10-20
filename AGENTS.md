@@ -7,7 +7,7 @@ description: checkoutOs is a redirect-based, SDK-less HTTP API payment orchestra
 You are an expert contributor for checkoutOs.
 
 Before writing code, always consult the project documentation:
-- `docs/adr/` — Architecture Decision Records (001 idempotency, 002 Paytm integration, 003 observability plan — *Proposed*; Phases 0–4 implemented: `src/telemetry/`, `/metrics` on :9464, structured event logs, `observability/` Prometheus/Loki stack, exposition snapshot, label guardrails, domain metrics; dashboards/alerts (5) and traces (6) pending).
+- `docs/adr/` — Architecture Decision Records (001 idempotency, 002 Paytm integration, 003 observability plan — *Proposed*; Phases 0–5 implemented: `src/telemetry/`, `/metrics` on :9464, structured event logs, `observability/` Prometheus/Loki stack, exposition snapshot, label guardrails, domain metrics, dashboards + alerts; traces (6) pending).
 - `docs/metrics.md` — **the user-facing metric contract**: every metric, type, unit, labels, allowed values, buckets, and the stability policy. Update it with any metric change.
 - `projectSpec/` — architecture spec (`v1oArchitectureDesign.md`), contributor guide (`contributorguide.md`), build steps (`Steps.md`), gateway guide (`GatewayIntegrationGuide.md` — currently a duplicate of `Steps.md`), plus PDF handbooks.
 - `idempotency.md` (repo root) — full idempotency implementation plan.
@@ -299,8 +299,13 @@ There is no `lint` script — run `npx eslint .` directly.
 - `CMD` preloads telemetry (`node --require ./dist/telemetry/tracing.js dist/server.js`). `APP_VERSION` is a build arg (`--build-arg APP_VERSION=...`), default `0.0.0`.
 - Port 9464 (`/metrics`) is `EXPOSE`d for documentation only and is **not** published by compose — scrape it on the compose network as `checkoutos:9464`.
 - `docker compose up` starts app + Redis. Compose overrides `REDIS_URL` to `redis://redis:6379`.
-- `docker compose --profile mock up` — **will fail**: references `Dockerfile.mock` which does not exist.
+- `docker compose --profile mock up` adds the MSW mock gateway on :9090 (`Dockerfile.mock`: `tsx mocks/server.ts`; mocks import nothing from `src/`).
+- `.dockerignore` keeps `node_modules`, `.env` (credentials), `.git`, `dist`, tests and docs out of every build context — keep it in step if a Dockerfile starts COPYing something new.
+- Every profile (none, `metrics`, `observability`, `mock`) was verified to start from a clean copy of the repo + `cp .env.example .env` (ADR 003 §10.1).
 - Tiered profiles (`observability/`, pulled in by `include:` in the root compose file; each a superset): `docker compose --profile metrics up -d --build` adds Prometheus + Grafana; `--profile observability` adds Loki + Alloy as well. Grafana: `http://localhost:3001` (127.0.0.1 only, anonymous admin — local use only; Prometheus is the default datasource). Prometheus, Loki and Alloy are not published.
+  - **Dashboards** (`observability/grafana/dashboards/*.json`: overview, gateways, webhooks, idempotency) are **generated** by `scripts/build-dashboards.mjs` — edit the generator, then run it; never hand-edit the JSON (CI runs `--check`). Provisioned read-only into a `checkoutOs` folder; Overview is the Grafana home.
+  - **Alerts**: `observability/prometheus/alerts.yml` (the 7 from ADR 003 §10.2), loaded by Prometheus; no Alertmanager is wired. Every rule needs a firing case in `alerts.test.yml` (`promtool test rules`, in CI), and every latency threshold must be a bucket boundary in `src/telemetry/buckets.ts` — `tests/unit/observability/alerts.test.ts` enforces that, plus that every `checkoutos_*` metric used in alerts/dashboards is documented in `docs/metrics.md`.
+  - **Examples** for other consumers (Prometheus, Alloy, Datadog, OTel Collector): `observability/examples/`.
   - Prometheus joins `checkoutos-network` (declared identically in both compose files — compose merges them) and scrapes `checkoutos:9464` every 15 s, 7-day retention. No scrape auth by default; if `METRICS_AUTH_TOKEN` is set, enable the commented `authorization` block in `observability/prometheus/prometheus.yml`. Query one request with `{service="checkoutos"} | trace_id="<id>"`.
   - Pipeline: app stdout JSON → Docker `json-file` (rotated: `max-size 10m`, `max-file 5`) → Alloy (`loki.source.docker`, Docker socket, filters on `com.docker.compose.service=checkoutos`) → Loki 3 (tsdb/v13, 7-day retention).
   - Loki **labels** (bounded): `service`, `env`, `level`, `component`, `compose_service`. **Structured metadata**: `trace_id`, `span_id`, `event`. Never promote IDs to labels.
