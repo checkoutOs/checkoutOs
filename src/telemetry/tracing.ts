@@ -19,7 +19,8 @@
 
 import dotenv from 'dotenv';
 import { NodeSDK } from '@opentelemetry/sdk-node';
-import type { SpanProcessor } from '@opentelemetry/sdk-trace-base';
+import { BatchSpanProcessor, type SpanProcessor } from '@opentelemetry/sdk-trace-base';
+import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-http';
 import { AggregationType } from '@opentelemetry/sdk-metrics';
 import { resourceFromAttributes } from '@opentelemetry/resources';
 import { ATTR_SERVICE_NAME, ATTR_SERVICE_VERSION } from '@opentelemetry/semantic-conventions';
@@ -32,6 +33,7 @@ import { HTTP_SERVER_BUCKETS } from './buckets';
 import { BUILD_INFO_METRIC, registerBuildInfo } from './metrics';
 import { startMetricsServer, type MetricsServer } from './metrics.server';
 import { buildMetricReaders, createPrometheusReader } from './readers';
+import { ErrorBiasedSpanProcessor } from './sampling';
 
 const SERVICE_NAME = 'checkoutos';
 const VERIFY_TIMEOUT_MS = 2_000;
@@ -66,6 +68,23 @@ class NoopSpanProcessor implements SpanProcessor {
   shutdown(): Promise<void> {
     return Promise.resolve();
   }
+}
+
+// ── Span processor ──────────────────────────────────────────────────────────
+// No OTLP traces endpoint (the default): the no-op processor above — spans
+// exist for trace_id, nothing leaves the process.
+// Endpoint set: OTLP over HTTP, batched, behind ErrorBiasedSpanProcessor —
+// every trace containing an error, plus TRACE_SAMPLE_RATIO (default 10%) of
+// the rest (ADR 003 §5 Phase 6). The exporter reads
+// OTEL_EXPORTER_OTLP_TRACES_ENDPOINT / OTEL_EXPORTER_OTLP_ENDPOINT and
+// OTEL_EXPORTER_OTLP_HEADERS itself.
+function buildSpanProcessor(rt: Runtime): SpanProcessor {
+  if (!rt.otlpTracesEnabled) {
+    return new NoopSpanProcessor();
+  }
+  return new ErrorBiasedSpanProcessor(new BatchSpanProcessor(new OTLPTraceExporter()), {
+    ratio: rt.traceSampleRatio,
+  });
 }
 
 // ── Load-order guard ────────────────────────────────────────────────────────
@@ -117,7 +136,7 @@ function startTelemetry(rt: Runtime): TelemetryHandle {
       'deployment.environment.name': rt.env,
     }),
 
-    spanProcessors: [new NoopSpanProcessor()],
+    spanProcessors: [buildSpanProcessor(rt)],
 
     // Empty, not omitted: with no processors NodeSDK falls back to
     // OTEL_LOGS_EXPORTER, whose default is OTLP. Logs never transit the OTel
