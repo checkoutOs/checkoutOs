@@ -1,0 +1,30 @@
+// observability/examples/config.alloy
+// Grafana Alloy scraping checkoutOs and remote-writing to any Prometheus-
+// compatible store (Prometheus, Mimir, Grafana Cloud) — ADR 003 §9.
+// One agent can do this AND ship logs (see ../alloy/config.alloy).
+//
+// Validate: alloy validate config.alloy
+
+prometheus.scrape "checkoutos" {
+  // job_name must stay "checkoutos" — the starter alerts match on it.
+  job_name        = "checkoutos"
+  scrape_interval = "15s"
+  targets         = [{ __address__ = "checkoutos:9464" }]
+  forward_to      = [prometheus.remote_write.default.receiver]
+
+  // Only when METRICS_AUTH_TOKEN is set on checkoutOs:
+  // bearer_token_file = "/etc/alloy/checkoutos-metrics-token"
+}
+
+prometheus.remote_write "default" {
+  endpoint {
+    url = "http://prometheus:9090/api/v1/write" // Prometheus needs --web.enable-remote-write-receiver
+
+    // Grafana Cloud / Mimir:
+    // url = "https://prometheus-prod-XX.grafana.net/api/prom/push"
+    // basic_auth {
+    //   username = "<instance id>"
+    //   password = sys.env("GRAFANA_CLOUD_API_KEY")
+    // }
+  }
+}

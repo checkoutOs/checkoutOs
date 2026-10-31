@@ -1,0 +1,35 @@
+# observability/examples/otel-collector.yaml
+# OpenTelemetry Collector scraping checkoutOs with the prometheus receiver —
+# for pipelines that want OTLP downstream (ADR 003 §9). Even an OTLP-centric
+# pipeline consumes the pull endpoint; checkoutOs never needs to push.
+#
+# Validate: otelcol-contrib validate --config otel-collector.yaml
+
+receivers:
+  prometheus:
+    config:
+      scrape_configs:
+        - job_name: checkoutos
+          scrape_interval: 15s
+          static_configs:
+            - targets: ['checkoutos:9464']
+          # Only when METRICS_AUTH_TOKEN is set on checkoutOs:
+          # authorization:
+          #   credentials_file: /etc/otelcol/checkoutos-metrics-token
+
+processors:
+  batch: {}
+
+exporters:
+  # Replace with your backend, e.g.:
+  # otlphttp:
+  #   endpoint: https://otlp.example.com
+  debug:
+    verbosity: basic
+
+service:
+  pipelines:
+    metrics:
+      receivers: [prometheus]
+      processors: [batch]
+      exporters: [debug]

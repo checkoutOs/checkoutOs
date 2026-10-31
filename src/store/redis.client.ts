@@ -37,23 +37,23 @@ export const redisClient = new Redis(config.redis.url, {
 // Event listeners
 
 redisClient.on('connect', (): void => {
-  log.info('Connected');
+  log.info('redis.connected');
 });
 
 redisClient.on('ready', (): void => {
-  log.info('Ready to accept commands');
+  log.info('redis.ready');
 });
 
 redisClient.on('error', (err: Error): void => {
-  log.error('Connection error', { message: err.message });
+  log.error('redis.connection_error', { errorMessage: err.message });
 });
 
 redisClient.on('close', (): void => {
-  log.warn('Connection closed');
+  log.warn('redis.connection_closed');
 });
 
 redisClient.on('reconnecting', (): void => {
-  log.warn('Reconnecting to Redis...');
+  log.warn('redis.reconnecting');
 });
 
 /*
@@ -72,10 +72,10 @@ export async function connectRedis(): Promise<void> {
 export async function disconnectRedis(): Promise<void> {
   try {
     await redisClient.quit();
-    log.info('Disconnected gracefully');
+    log.info('redis.disconnected');
   } catch (err: unknown) {
     redisClient.disconnect();
-    log.warn('Redis quit failed, forcing disconnect', {
+    log.warn('redis.quit_failed', {
       error: err instanceof Error ? err.message : String(err),
     });
   }
@@ -86,7 +86,7 @@ export async function pingRedis(): Promise<number> {
   try {
     await redisClient.ping();
     const latencyMs = Date.now() - start;
-    log.debug('Ping successful', { latencyMs });
+    log.debug('redis.ping_ok', { latencyMs });
     return latencyMs;
   } catch (err) {
     throw new StoreError('ping', err);

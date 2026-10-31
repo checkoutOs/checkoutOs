@@ -1,0 +1,81 @@
+# .github/workflows/ci.yml
+# Static checks, then the run order from AGENTS.md:
+#   test:unit && test:integration && verify:telemetry
+#
+# verify:telemetry runs with --check: it fails when the live /metrics shape no
+# longer matches the committed observability/exposition.snapshot.txt — a
+# metric contract change that was not committed (ADR 003 §7.3). Fix by running
+# `npm run verify:telemetry` locally, reviewing the diff, and committing it.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    env:
+      # No .env in CI. The app's required variables; verify:telemetry supplies
+      # its own gateway (a local stub) and ports.
+      REDIS_URL: redis://localhost:6379
+      WEBHOOK_RELAY_URL: http://127.0.0.1:9/relay
+      HUSKY: '0'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          # Matches the Dockerfile base image (node:20-alpine).
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Lint
+        run: npx eslint .
+
+      - name: Import cycles
+        run: npm run lint:circular
+
+      - name: Log event names
+        run: node scripts/log-events.mjs check
+
+      # Dashboards are generated (scripts/build-dashboards.mjs); fail if the
+      # committed JSON is stale, then syntax-check every panel query and run
+      # the alert rules' promtool unit tests (ADR 003 §10).
+      - name: Dashboards and alerts
+        run: |
+          node scripts/build-dashboards.mjs --check --promql-rules "$RUNNER_TEMP/dashboard-queries.yml"
+          docker run --rm --entrypoint promtool -v "$RUNNER_TEMP:/q" \
+            prom/prometheus:v3.5.0 check rules --lint=none /q/dashboard-queries.yml
+          docker run --rm --entrypoint promtool -v "$PWD/observability/prometheus:/r" \
+            prom/prometheus:v3.5.0 test rules /r/alerts.test.yml
+
+      # One step, as specified: each stage runs only if the previous passed.
+      # Integration tests hit the real Razorpay sandbox (see AGENTS.md).
+      - name: Tests and telemetry
+        run: npm run test:unit && npm run test:integration && npm run verify:telemetry -- --check

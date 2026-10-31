@@ -16,13 +16,14 @@
 //   webhookRouter       ← handles POST /webhooks/:gateway
 //   express.json()      ← runs after, applies to all other routes
 
-import express, { Application, Request, Response, NextFunction } from 'express';
+import express, { Application } from 'express';
 import { registerGateways } from './gateways/gateway.registry';
 import { connectRedis } from './store/redis.client';
 import { config } from './config';
 import type { SupportedGatewayName } from './gateways/gateway.registry';
 import { errorHandler } from './middleware/error.middleware';
 import { notFoundHandler } from './middleware/not-found.middleware';
+import { requestLogger } from './middleware/request-logger';
 import { createContextLogger } from './utils/logger';
 import { checkoutRouter } from './routes/checkout.routes';
 import { healthRouter, refundRouter, paymentRouter, webhookRouter } from './routes';
@@ -38,24 +39,7 @@ export function buildApp(): Application {
 
   // ── 1. Request logger ────────────────────────────────────────────────────
   // Must be first — captures all requests including those that fail early.
-  // Log level follows HTTP status: 5xx → error, 4xx → warn, 2xx/3xx → info.
-  app.use((req: Request, res: Response, next: NextFunction): void => {
-    const start = Date.now();
-
-    res.on('finish', (): void => {
-      const latencyMs = Date.now() - start;
-      const level = res.statusCode >= 500 ? 'error' : res.statusCode >= 400 ? 'warn' : 'info';
-
-      log[level](`${req.method} ${req.path}`, {
-        method: req.method,
-        path: req.path,
-        statusCode: res.statusCode,
-        latencyMs,
-      });
-    });
-
-    next();
-  });
+  app.use(requestLogger);
 
   // ── 2. Gateway-specific webhook body parsers — BEFORE express.json() ─────
   // Each gateway requires a different body format for webhook verification:
@@ -107,9 +91,9 @@ export async function initialise(): Promise<void> {
     config.gateway.active as SupportedGatewayName,
   );
 
-  log.info('Gateway registered', { gateway: config.gateway.active });
+  log.info('server.gateway_registered', { gateway: config.gateway.active });
 
   await connectRedis();
 
-  log.info('Redis connected');
+  log.info('server.redis_connected');
 }

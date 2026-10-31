@@ -1,0 +1,22 @@
+# observability/prometheus/prometheus.yml
+# Scrapes the checkoutOs /metrics listener over the compose network.
+# Port 9464 is never published to the host (ADR 003 §3.5).
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+# Starter alerts (ADR 003 §10.2). No Alertmanager is wired: firing alerts show
+# in Prometheus and Grafana. Point alerting.alertmanagers at yours to notify.
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+scrape_configs:
+  - job_name: checkoutos
+    static_configs:
+      - targets: ['checkoutos:9464']
+    # Leave METRICS_AUTH_TOKEN unset when 9464 is reachable only on this
+    # network. If you do set it, put the same token in a file mounted into
+    # this container and uncomment:
+    # authorization:
+    #   credentials_file: /etc/prometheus/metrics-token

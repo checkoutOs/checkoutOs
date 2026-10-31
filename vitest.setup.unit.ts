@@ -11,6 +11,7 @@
 //   Mocking here intercepts the import before any test file loads redis.client.
 
 import { vi, afterAll } from 'vitest';
+import { configureLogger } from './src/utils/logger';
 
 // ---------------------------------------------------------------------------
 // Mock ioredis with ioredis-mock
@@ -31,24 +32,12 @@ vi.mock('ioredis', async () => {
 // ---------------------------------------------------------------------------
 // Tests produce a lot of expected errors (testing error paths).
 // Logging these to stdout makes test output unreadable.
-// The logger already has `silent: config.isTest` — this is belt-and-suspenders.
 
-vi.mock('./src/utils/logger', () => ({
-  logger: {
-    info: vi.fn(),
-    warn: vi.fn(),
-    error: vi.fn(),
-    debug: vi.fn(),
-  },
-  // Mirrors the real module surface — server.ts calls this at startup.
-  configureLogger: vi.fn(),
-  createContextLogger: () => ({
-    info: vi.fn(),
-    warn: vi.fn(),
-    error: vi.fn(),
-    debug: vi.fn(),
-  }),
-}));
+// The REAL logger runs in tests — no mock, so tests never drift from the
+// logger's actual shape. This setup file is the test composition root: like
+// server.ts in production, it hands the logger its settings. isTest sets
+// logger.silent. A test that needs output can call configureLogger() itself.
+configureLogger({ isTest: true, isDevelopment: false });
 
 // ---------------------------------------------------------------------------
 // Set test environment variables

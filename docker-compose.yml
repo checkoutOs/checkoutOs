@@ -10,10 +10,21 @@
 #   docker compose down            # stop and remove containers
 #   docker compose logs -f         # follow logs
 #   docker compose logs checkoutos # logs for one service
+#   docker compose --profile metrics up -d --build
+#                                  # + Prometheus, Grafana on :3001 (ADR 003)
+#   docker compose --profile observability up -d --build
+#                                  # + Loki and Alloy as well
+#   docker compose --profile tracing up -d --build
+#                                  # + Tempo (set OTEL_EXPORTER_OTLP_TRACES_ENDPOINT)
 #
 # Prerequisites:
 #   cp .env.example .env
 #   Fill in RAZORPAY_* credentials or leave as-is for mock server usage
+
+# Observability stack (profiles: metrics, observability). Every service in it is
+# profile-gated, so it adds nothing to a plain `docker compose up`.
+include:
+  - observability/docker-compose.observability.yml
 
 services:
 
@@ -64,10 +75,14 @@ services:
       context: .
       dockerfile: Dockerfile
       target: production
+      args:
+        APP_VERSION: ${APP_VERSION:-0.0.0}
     container_name: checkoutos-api
     restart: unless-stopped
     ports:
       - "${PORT:-3000}:3000"
+      # 9464 (/metrics) is deliberately NOT published — scrape it over the
+      # compose network as checkoutos:9464 (ADR 003 §3.5).
     env_file:
       # Loads all variables from .env
       # Copy .env.example to .env and fill in your values
@@ -76,9 +91,24 @@ services:
       # Override REDIS_URL to use the Redis service by container name
       # This takes precedence over any value in .env
       REDIS_URL: redis://redis:6379
+      # Traces (ADR 003 §5 Phase 6). Empty → spans are exported nowhere. With the
+      # tracing profile, run:
+      #   OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://tempo:4318/v1/traces \
+      #     docker compose --profile tracing up -d --build
+      # (or set it in .env). Exporting to a Tempo that is not running only
+      # costs dropped batches, but keep it opt-in.
+      OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: ${OTEL_EXPORTER_OTLP_TRACES_ENDPOINT:-}
     depends_on:
       redis:
         condition: service_healthy
+    # Bounded stdout logs. Alloy reads this json-file log through the Docker
+    # API; rotation can drop lines under very high volume, so size it
+    # deliberately rather than relying on the unbounded default (ADR 003 §10.1).
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:3000/health"]
       interval: 30s

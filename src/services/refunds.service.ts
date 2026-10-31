@@ -28,7 +28,9 @@ import type {
   RefundStatusResponse,
   StoreRefund,
 } from '../types/payment.types';
-import type { CreateRefundParams } from '../types/gateway.types';
+import type { CreateRefundParams, GatewayRefundResult } from '../types/gateway.types';
+import { telemetry } from '../telemetry/metrics';
+import { refundAmountLabels, refundLabels, transitionLabels } from '../telemetry/attributes';
 
 const log = createContextLogger('refund-service');
 
@@ -53,7 +55,14 @@ export async function createRefund(
   //   - status is SUCCESS or PARTIALLY_REFUNDED
   //   - refund amount does not exceed remaining refundable amount
   //   - gatewayPaymentId is set (webhook received)
-  const { stored, refundAmount } = await validateAndPrepareRefund(chkId, req);
+  let validated: Awaited<ReturnType<typeof validateAndPrepareRefund>>;
+  try {
+    validated = await validateAndPrepareRefund(chkId, req);
+  } catch (err) {
+    telemetry().refunds.add(1, refundLabels(config.gateway.active, 'rejected'));
+    throw err;
+  }
+  const { stored, refundAmount } = validated;
 
   const plugin = getActiveGateway();
 
@@ -64,14 +73,20 @@ export async function createRefund(
     ...(req.reason !== undefined && { reason: req.reason }),
   };
 
-  log.info('Creating refund', {
+  log.info('refund.creating', {
     chkId,
     gateway: stored.gateway,
     gatewayPaymentId: stored.gatewayPaymentId,
     amount: refundAmount,
   });
 
-  const gatewayResult = await plugin.createRefund(params);
+  let gatewayResult: GatewayRefundResult;
+  try {
+    gatewayResult = await plugin.createRefund(params);
+  } catch (err) {
+    telemetry().refunds.add(1, refundLabels(stored.gateway, 'gateway_error'));
+    throw err;
+  }
 
   // --- Step 3: Generate ref_ ID ---
   const refId = generateRefundId();
@@ -91,8 +106,11 @@ export async function createRefund(
   };
 
   await saveRefund(storeRefund);
+  const m = telemetry();
+  m.refunds.add(1, refundLabels(stored.gateway, 'created'));
+  m.refundAmountMinor.add(refundAmount, refundAmountLabels(stored.gateway, stored.currency));
 
-  log.info('Refund created', {
+  log.info('refund.created', {
     refId,
     chkId,
     gatewayRefundId: gatewayResult.gatewayRefundId,
@@ -108,8 +126,12 @@ export async function createRefund(
     refundAmount === stored.amount ? PaymentStatus.REFUNDED : PaymentStatus.PARTIALLY_REFUNDED;
 
   await updatePaymentStatus(chkId, newPaymentStatus);
+  telemetry().paymentTransitions.add(
+    1,
+    transitionLabels(stored.gateway, stored.status, newPaymentStatus, 'refund'),
+  );
 
-  log.info('Parent payment status updated after refund', {
+  log.info('refund.payment_status_updated', {
     chkId,
     newPaymentStatus,
   });
@@ -159,7 +181,7 @@ export async function getRefundStatus(refId: string): Promise<RefundStatusRespon
   }
 
   // Stale non-terminal: re-poll gateway
-  log.info('Refund status stale — re-polling gateway', {
+  log.info('refund.status_repoll', {
     refId,
     status: stored.status,
     ageMs,
@@ -173,7 +195,7 @@ export async function getRefundStatus(refId: string): Promise<RefundStatusRespon
     stored.status = fresh.status;
     stored.updatedAt = now();
 
-    log.info('Refund status updated from gateway poll', {
+    log.info('refund.status_updated_from_poll', {
       refId,
       newStatus: fresh.status,
     });

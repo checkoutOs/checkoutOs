@@ -1,0 +1,177 @@
+# observability/docker-compose.observability.yml
+# Local observability stack for checkoutOs (ADR 003 §5 Phases 1–2, §10.1).
+# Included from the root docker-compose.yml. Tiered profiles — each a superset
+# of the previous one; a plain `docker compose up` starts none of this:
+#
+#   docker compose --profile metrics up -d --build        # + Prometheus, Grafana
+#   docker compose --profile observability up -d --build  # + Loki, Alloy
+#   OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://tempo:4318/v1/traces \
+#     docker compose --profile tracing up -d --build       # + Tempo
+#
+#   metrics:  checkoutos:9464/metrics → Prometheus → Grafana
+#   logs:     checkoutos stdout (JSON) → Docker json-file → Alloy → Loki → Grafana
+#
+#   open http://localhost:3001  → Explore
+#     Prometheus: checkoutos_http_server_request_duration_count
+#     Loki:       {service="checkoutos"} | trace_id="<id>"   ← one request's lines
+#
+# Only Grafana is published, and only on 127.0.0.1: it runs with anonymous
+# admin access for local use. Prometheus, Loki and Alloy stay on the compose
+# networks, and the app's 9464 is never published (ADR 003 §3.5).
+# Never run this file as-is on a shared host.
+
+services:
+  # ── Prometheus — scrapes /metrics ──────────────────────────────────────────
+  # Joins checkoutos-network to reach checkoutos:9464, and observability so
+  # Grafana can query it.
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    container_name: checkoutos-prometheus
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      # 7 days, like Loki. Retention is the disk-growth control (ADR 003 §10.1).
+      - --storage.tsdb.retention.time=7d
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus_data:/prometheus
+    healthcheck:
+      test: ['CMD-SHELL', 'wget -qO- http://localhost:9090/-/ready | grep -qi ready']
+      interval: 10s
+      timeout: 5s
+      start_period: 20s
+      retries: 10
+    networks:
+      - checkoutos-network
+      - observability
+    profiles:
+      - metrics
+      - observability
+      - tracing
+
+  # ── Loki — log store ───────────────────────────────────────────────────────
+  loki:
+    image: grafana/loki:3.5.0
+    container_name: checkoutos-loki
+    restart: unless-stopped
+    command: ['-config.file=/etc/loki/loki-config.yml']
+    volumes:
+      - ./loki/loki-config.yml:/etc/loki/loki-config.yml:ro
+      - loki_data:/loki
+    healthcheck:
+      test: ['CMD-SHELL', 'wget -qO- http://localhost:3100/ready | grep -q ready']
+      interval: 10s
+      timeout: 5s
+      start_period: 20s
+      retries: 10
+    networks:
+      - observability
+    profiles:
+      - observability
+      - tracing
+
+  # ── Alloy — tails container stdout, ships to Loki ──────────────────────────
+  # Reads logs through the Docker API, so it needs the socket (read-only).
+  # Promtail is deprecated — do not replace this with it (ADR 003 §5 Phase 1c).
+  alloy:
+    image: grafana/alloy:v1.10.0
+    container_name: checkoutos-alloy
+    restart: unless-stopped
+    command:
+      - run
+      - --server.http.listen-addr=0.0.0.0:12345
+      - --storage.path=/var/lib/alloy/data
+      - /etc/alloy/config.alloy
+    volumes:
+      - ./alloy/config.alloy:/etc/alloy/config.alloy:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      # Read positions survive restarts, so lines are not re-shipped.
+      - alloy_data:/var/lib/alloy/data
+    depends_on:
+      loki:
+        condition: service_healthy
+    networks:
+      - observability
+    profiles:
+      - observability
+      - tracing
+
+  # ── Tempo — trace store (profile: tracing) ─────────────────────────────────
+  # Receives OTLP from checkoutOs on checkoutos-network. checkoutOs exports
+  # only when OTEL_EXPORTER_OTLP_TRACES_ENDPOINT is set — the tracing profile
+  # alone does not turn export on (see the root docker-compose.yml).
+  tempo:
+    image: grafana/tempo:2.8.2
+    container_name: checkoutos-tempo
+    restart: unless-stopped
+    command: ['-config.file=/etc/tempo/tempo.yml']
+    volumes:
+      - ./tempo/tempo.yml:/etc/tempo/tempo.yml:ro
+      - tempo_data:/var/tempo
+    healthcheck:
+      # Exec form: the Tempo image has no shell. wget fails on /ready's 503.
+      test: ['CMD', 'wget', '-q', '-O', '/dev/null', 'http://localhost:3200/ready']
+      interval: 10s
+      timeout: 5s
+      start_period: 30s
+      retries: 10
+    networks:
+      - checkoutos-network
+      - observability
+    profiles:
+      - tracing
+
+  # ── Grafana — query UI ─────────────────────────────────────────────────────
+  # Port 3001: 3000 is the checkoutOs API. Both datasources are always
+  # provisioned; Loki simply has no data under the metrics profile.
+  grafana:
+    image: grafana/grafana:12.1.0
+    container_name: checkoutos-grafana
+    restart: unless-stopped
+    ports:
+      - '127.0.0.1:3001:3000'
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: 'true'
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: 'true'
+      GF_ANALYTICS_REPORTING_ENABLED: 'false'
+      GF_ANALYTICS_CHECK_FOR_UPDATES: 'false'
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /etc/grafana/dashboards/checkoutos-overview.json
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/etc/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      prometheus:
+        condition: service_healthy
+      # Not started under the metrics profile — required: false lets Grafana
+      # run without it.
+      loki:
+        condition: service_healthy
+        required: false
+      tempo:
+        condition: service_healthy
+        required: false
+    networks:
+      - observability
+    profiles:
+      - metrics
+      - observability
+      - tracing
+
+volumes:
+  prometheus_data:
+  loki_data:
+  tempo_data:
+  alloy_data:
+  grafana_data:
+
+networks:
+  # Declared identically in the root docker-compose.yml; compose merges them.
+  # Only Prometheus joins it — Alloy collects through the Docker socket.
+  checkoutos-network:
+    driver: bridge
+  observability:
+    driver: bridge

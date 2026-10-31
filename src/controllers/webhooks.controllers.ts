@@ -50,7 +50,7 @@ export const receive = asyncHandler(
     const body: unknown = req.body;
     const headers = req.headers as Record<string, string | string[] | undefined>;
 
-    log.debug('Webhook received', { gateway });
+    log.debug('webhook.received', { gateway });
 
     try {
       await processWebhook(gateway, body, headers);
@@ -66,7 +66,7 @@ export const receive = asyncHandler(
         throw err; // handled by error middleware → 401
       }
 
-      log.error('Webhook processing failed', {
+      log.error('webhook.processing_failed', {
         gateway,
         error: err instanceof Error ? err.message : typeof err === 'string' ? err : 'Unknown error',
       });

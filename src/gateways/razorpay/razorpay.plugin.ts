@@ -26,6 +26,8 @@ import {
 } from '../../errors/gateways.errors';
 import { PaymentCreationFailedError } from '../../errors/payment.errors';
 
+import { createContextLogger } from '../../utils/logger';
+
 import { RazorpayMapper } from './razorpay.mapper';
 import type {
   RazorpayOrder,
@@ -42,6 +44,8 @@ import type {
 // ---------------------------------------------------------------------------
 
 const REQUEST_TIMEOUT_MS = 10_000;
+
+const log = createContextLogger('razorpay-plugin');
 
 // ---------------------------------------------------------------------------
 // Credentials and Config
@@ -91,18 +95,20 @@ function isTimeoutError(err: unknown): boolean {
   return axios.isAxiosError(err) && err.code === 'ECONNABORTED';
 }
 
-// ✅ FIXED: Better error extraction with full logging
+// Extract error reason from Razorpay API error responses.
+// Logs status and Razorpay's error code/reason only — never the response body,
+// which can carry payment and customer details (ADR 003 §8).
 function extractRazorpayErrorReason(err: AxiosError): string {
   const data = err.response?.data as RazorpayApiError | undefined;
 
-  // Log full error for debugging
-  console.error('=== RAZORPAY API ERROR ===');
-  console.error('Status:', err.response?.status);
-  console.error('Status Text:', err.response?.statusText);
-  console.error('URL:', err.config?.url);
-  console.error('Method:', err.config?.method);
-  console.error('Response Data:', JSON.stringify(data, null, 2));
-  console.error('===========================');
+  log.error('gateway.api_error', {
+    gateway: 'razorpay',
+    status: err.response?.status,
+    method: err.config?.method,
+    url: err.config?.url,
+    errorCode: data?.error?.code,
+    errorReason: data?.error?.reason,
+  });
 
   // Return descriptive error
   if (data?.error?.description) {
@@ -202,7 +208,6 @@ export class RazorpayPlugin implements GatewayPlugin {
     };
   }
 
-  // ✅ FIXED: Added debug logging for refund
   public async createRefund(params: CreateRefundParams): Promise<GatewayRefundResult> {
     const refundPayload: Record<string, unknown> = {};
 
@@ -214,16 +219,6 @@ export class RazorpayPlugin implements GatewayPlugin {
       refundPayload.notes = { reason: params.reason };
     }
 
-    // ✅ DEBUG: Log what we're sending
-    console.log('=== CREATE REFUND REQUEST ===');
-    console.log('gatewayPaymentId:', params.gatewayPaymentId);
-    console.log('amount:', params.amount ?? 'full');
-    console.log(
-      'URL:',
-      `${this.http.defaults.baseURL}/payments/${params.gatewayPaymentId}/refunds`,
-    );
-    console.log('==============================');
-
     let refund: RazorpayRefund;
 
     try {
@@ -232,7 +227,6 @@ export class RazorpayPlugin implements GatewayPlugin {
         refundPayload,
       );
       refund = response.data;
-      console.log('✅ Refund created:', refund.id);
     } catch (err) {
       if (isTimeoutError(err)) {
         throw new GatewayTimeoutError(this.name, 'createRefund');

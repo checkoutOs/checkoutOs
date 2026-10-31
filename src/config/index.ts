@@ -59,6 +59,21 @@ export const config = {
   },
   app: {
     baseUrl: process.env.BASE_URL || 'http://localhost:3000',
+    version: env.APP_VERSION,
+  },
+
+  // ── Logging
+  // undefined → logger picks its default (pretty in development, JSON otherwise)
+  log: {
+    format: env.LOG_FORMAT,
+  },
+
+  // ── Metrics (ADR 003)
+  // src/telemetry/ reads the same values through config/runtime.ts, because it
+  // loads before this module exists. This copy is the Zod-validated one.
+  metrics: {
+    port: env.METRICS_PORT,
+    authToken: env.METRICS_AUTH_TOKEN,
   },
 
   // ── Webhook relay

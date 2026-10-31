@@ -5,6 +5,7 @@
 // - Gateway credentials are conditionally required based on active gateway
 // - Sensitive values like secrets and keys are never logged
 // - Only this file and config/index.ts ever read process.env
+//   (sole exception: config/runtime.ts, the telemetry bootstrap's early read)
 
 import { z } from 'zod';
 import {
@@ -50,6 +51,37 @@ const BaseEnvSchema = z.object({
     .refine((val): boolean => val.startsWith('http://') || val.startsWith('https://'), {
       message: 'WEBHOOK_RELAY_URL must use http or https',
     }),
+
+  // ── Observability (ADR 003) ────────────────────────────────────────────────
+  // The telemetry bootstrap reads these early through config/runtime.ts,
+  // before this schema has run. Validation here is still what fails startup.
+
+  // Stamped onto every log record and the OTel resource (service.version).
+  // Set from a Docker build arg in production.
+  APP_VERSION: z.string().min(1, 'APP_VERSION must not be empty').default('0.0.0'),
+
+  // Unset → pretty in development, JSON everywhere else.
+  LOG_FORMAT: z.enum(['json', 'pretty']).optional(),
+
+  // Internal metrics listener — never the public API port.
+  METRICS_PORT: z.coerce
+    .number()
+    .int()
+    .min(1024, 'METRICS_PORT must be >= 1024')
+    .max(65535, 'METRICS_PORT must be <= 65535')
+    .default(9464),
+
+  // Unset → no auth on /metrics (network isolation assumed).
+  METRICS_AUTH_TOKEN: z.string().min(1, 'METRICS_AUTH_TOKEN must not be empty when set').optional(),
+
+  // Share of NON-error traces exported when an OTLP traces endpoint is set;
+  // traces containing an error are always exported. Read early by
+  // config/runtime.ts — validated here so a bad value still fails startup.
+  TRACE_SAMPLE_RATIO: z.coerce
+    .number()
+    .min(0, 'TRACE_SAMPLE_RATIO must be between 0 and 1')
+    .max(1, 'TRACE_SAMPLE_RATIO must be between 0 and 1')
+    .default(0.1),
 
   // ── Razorpay credentials ───────────────────────────────────────────────────
   // Optional at schema level — conditionally required in superRefine below
@@ -123,6 +155,15 @@ export const EnvSchema = BaseEnvSchema.superRefine((env, ctx): void => {
   for (const envKey of gatewayDef.requiredEnvKeys) {
     // Registry guarantees envKey exists in BaseEnvSchema.
     requireField(envKey as keyof typeof env, envKey);
+  }
+
+  // Two listeners on one port is EADDRINUSE at boot — catch it as config.
+  if (env.METRICS_PORT === env.PORT) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['METRICS_PORT'],
+      message: `METRICS_PORT must differ from PORT (both are ${env.PORT})`,
+    });
   }
 });
 

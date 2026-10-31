@@ -1,0 +1,24 @@
+# Dockerfile.mock
+# MSW mock gateway server (Razorpay + Paytm) for `docker compose --profile mock`.
+# Development only — never deploy it. Runs mocks/server.ts with tsx; the mocks
+# import nothing from src/, so only mocks/ and the dev dependencies are needed.
+
+FROM node:20-alpine
+
+WORKDIR /app
+
+COPY package*.json ./
+
+# Same reason as the main Dockerfile: husky's `prepare` needs a .git directory.
+RUN npm pkg delete scripts.prepare && \
+    npm ci
+
+COPY tsconfig.json ./
+COPY mocks/ ./mocks/
+
+ENV MOCK_PORT=9090
+EXPOSE 9090
+
+USER node
+
+CMD ["npx", "tsx", "mocks/server.ts"]

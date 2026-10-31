@@ -43,6 +43,13 @@ import { ORDER_ID_MAX_LENGTH, ORDER_ID_PATTERN } from '../types/common.types';
 import { checkIdempotency, completeIdempotency, releaseIdempotency } from './idempotency.service';
 import { findPaymentByOrderId, reserveOrderId } from '../store/payment.store';
 import { IdempotencyRequestInProgressError } from '../errors';
+import { telemetry } from '../telemetry/metrics';
+import {
+  orderIdConflictLabels,
+  paymentCreatedLabels,
+  pollLabels,
+  transitionLabels,
+} from '../telemetry/attributes';
 
 const log = createContextLogger('payment-service');
 
@@ -139,7 +146,7 @@ export async function createPayment(
     ...(req.metadata !== undefined && { metadata: req.metadata }),
   };
 
-  log.info('Creating payment', {
+  log.info('payment.creating', {
     gateway: config.gateway.active,
     orderId: req.orderId,
     amount: req.amount,
@@ -174,9 +181,13 @@ export async function createPayment(
   };
 
   await savePayment(stored);
+  telemetry().paymentsCreated.add(
+    1,
+    paymentCreatedLabels(stored.gateway, stored.currency, stored.status),
+  );
   // create reverse lookup for gatewayOrderId for webhook to find the payment by orderId
 
-  log.info('Payment created', {
+  log.info('payment.created', {
     chkId,
     gatewayOrderId: gatewayResult.gatewayId,
     status: gatewayResult.status,
@@ -279,7 +290,7 @@ export async function createPaymentWithIdempotency(
 
     // HIT — return cached response from a prior successful request
     if (checkResult.type === 'HIT') {
-      log.info('Idempotency HIT — returning cached payment', {
+      log.info('idempotency.hit_served', {
         key: idempotency.key,
       });
       return checkResult.response as PaymentResponse;
@@ -328,37 +339,41 @@ export async function createPaymentWithIdempotency(
       // Reservation held but no payment yet: a concurrent request is mid-create.
       // Nothing was created at the gateway on this path, so the idempotency
       // claim is provably safe to hand back before surfacing the 409.
-      log.warn('orderId.creation_in_progress', { orderId: req.orderId });
+      log.warn('orderid.creation_in_progress', { orderId: req.orderId });
+      telemetry().orderIdReservationConflicts.add(1, orderIdConflictLabels('in_progress'));
       await releaseClaim(idempotency, 'orderId.creation_in_progress');
       throw new OrderCreationInProgressError(req.orderId);
     }
     // Validate amount matches
     if (existingByOrderId.amount !== req.amount) {
-      log.error('orderId.amount_mismatch', {
+      log.error('orderid.amount_mismatch', {
         orderId: req.orderId,
         existingAmount: existingByOrderId.amount,
         newAmount: req.amount,
       });
+      telemetry().orderIdReservationConflicts.add(1, orderIdConflictLabels('amount_mismatch'));
       await releaseClaim(idempotency, 'orderId.amount_mismatch');
       throw new OrderIdAmountMismatchError(req.orderId, existingByOrderId.amount, req.amount);
     }
 
     // Validate currency matches
     if (existingByOrderId.currency !== req.currency) {
-      log.error('orderId.currency_mismatch', {
+      log.error('orderid.currency_mismatch', {
         orderId: req.orderId,
         existingCurrency: existingByOrderId.currency,
         newCurrency: req.currency,
       });
+      telemetry().orderIdReservationConflicts.add(1, orderIdConflictLabels('currency_mismatch'));
       await releaseClaim(idempotency, 'orderId.currency_mismatch');
       throw new OrderIdCurrencyMismatchError(req.orderId, existingByOrderId.currency, req.currency);
     }
 
     // Same orderId, same amount, same currency — serve the existing payment
-    log.debug('orderId.dedup_hit', {
+    log.debug('orderid.dedup_hit', {
       orderId: req.orderId,
       chkId: existingByOrderId.chkId,
     });
+    telemetry().orderIdReservationConflicts.add(1, orderIdConflictLabels('deduplicated'));
 
     response = {
       paymentId: existingByOrderId.chkId,
@@ -432,7 +447,7 @@ export async function getPaymentStatus(chkId: string): Promise<PaymentStatusResp
 
   // Don't re-poll if terminal status found
   if (TERMINAL_STATUSES.has(stored.status)) {
-    log.debug('Payment status terminal - serving from Redis', {
+    log.debug('payment.status_served_terminal', {
       chkId,
       status: stored.status,
     });
@@ -443,7 +458,7 @@ export async function getPaymentStatus(chkId: string): Promise<PaymentStatusResp
   const ageMs = Date.now() - new Date(stored.updatedAt).getTime();
 
   if (ageMs < REPOLL_STALENESS_MS) {
-    log.debug('Payment status fresh - serving from Redis', {
+    log.debug('payment.status_served_fresh', {
       chkId,
       status: stored.status,
       ageMs,
@@ -452,7 +467,7 @@ export async function getPaymentStatus(chkId: string): Promise<PaymentStatusResp
   }
 
   // Stale non-terminal: re-poll gateway
-  log.info('Payment status stale - re-polling gateway', {
+  log.info('payment.status_repoll', {
     chkId,
     status: stored.status,
     ageMs,
@@ -466,13 +481,14 @@ export async function getPaymentStatus(chkId: string): Promise<PaymentStatusResp
   //  Never allow polling to transition to SUCCESS
   // SUCCESS must come from webhook to ensure gatewayPaymentId is populated
   if (fresh.status === PaymentStatus.SUCCESS) {
-    log.warn('Polling detected SUCCESS status - waiting for webhook backfill', {
+    log.warn('payment.poll_success_suppressed', {
       chkId,
       currentStatus: stored.status,
       gatewayOrderId: stored.gatewayOrderId,
       hasGatewayPaymentId: stored.gatewayPaymentId !== '',
       reason: 'SUCCESS requires webhook to populate gatewayPaymentId',
     });
+    telemetry().pollSuccessSuppressed.add(1, pollLabels(stored.gateway));
 
     // Return current Redis state (still PENDING/PROCESSING)
     // The webhook will handle the transition and backfill gatewayPaymentId
@@ -487,7 +503,7 @@ export async function getPaymentStatus(chkId: string): Promise<PaymentStatusResp
   ].includes(fresh.status);
 
   if (requiresGatewayPaymentId && stored.gatewayPaymentId === '') {
-    log.warn('Polling detected refund status - waiting for webhook backfill', {
+    log.warn('payment.poll_refund_status_suppressed', {
       chkId,
       freshStatus: fresh.status,
       currentStatus: stored.status,
@@ -503,10 +519,14 @@ export async function getPaymentStatus(chkId: string): Promise<PaymentStatusResp
   if (fresh.status !== stored.status) {
     const oldStatus = stored.status;
     await updatePaymentStatus(chkId, fresh.status);
+    telemetry().paymentTransitions.add(
+      1,
+      transitionLabels(stored.gateway, oldStatus, fresh.status, 'poll'),
+    );
     stored.status = fresh.status;
     stored.updatedAt = now();
 
-    log.info('Payment status updated from gateway poll', {
+    log.info('payment.status_updated_from_poll', {
       chkId,
       oldStatus,
       newStatus: fresh.status,
@@ -574,7 +594,7 @@ export async function validateAndPrepareRefund(
       'AWAITING_WEBHOOK — payment.captured webhook has not been received yet',
     );
   }
-  log.info('Refund validation passed', {
+  log.info('refund.validation_passed', {
     chkId,
     refundAmount,
     paymentStatus: stored.status,

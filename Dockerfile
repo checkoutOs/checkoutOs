@@ -48,6 +48,12 @@ RUN npm run build
 
 FROM node:20-alpine AS production
 
+# Release version → APP_VERSION → every log record and the OTel resource
+# (service.version). Pass it at build time:
+#   docker build --build-arg APP_VERSION=$(git describe --tags --always) .
+ARG APP_VERSION=0.0.0
+ENV APP_VERSION=$APP_VERSION
+
 # Security: run as non-root user
 # node:alpine ships with a 'node' user (uid 1000) built in
 RUN addgroup -g 1001 -S checkoutos && \
@@ -77,10 +83,15 @@ USER checkoutos
 # This is documentation — the actual port is controlled by the PORT env var
 EXPOSE 3000
 
+# Internal /metrics listener (ADR 003 §3.5). Documentation only — keep it on
+# the internal network for the scraper; never publish it to the host.
+EXPOSE 9464
+
 # Health check — Docker will mark the container unhealthy if this fails
 # Starts checking 30s after startup, checks every 30s, allows 10s per check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
   CMD wget -qO- http://localhost:3000/health || exit 1
 
-# Start the compiled server
-CMD ["node", "dist/server.js"]
+# Start the compiled server. The telemetry bootstrap is preloaded so the OTel
+# SDK patches express, winston and ioredis before they load (ADR 003 §5).
+CMD ["node", "--require", "./dist/telemetry/tracing.js", "dist/server.js"]
